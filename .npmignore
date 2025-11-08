@@ -1,0 +1,25 @@
+# Source files
+src/
+tests/
+examples/
+
+# Config files
+tsconfig.json
+biome.json
+.gitignore
+.git
+
+# Documentation for development only
+CLAUDE.md
+
+# Build artifacts
+*.log
+*.tsbuildinfo
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Node
+node_modules/

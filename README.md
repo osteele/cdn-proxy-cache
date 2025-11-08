@@ -1,0 +1,306 @@
+# cdn-proxy-cache
+
+A caching proxy for CDN resources with URL rewriting, content transformation, and Express integration. Enables offline development by caching CDN assets locally.
+
+## Features
+
+- **Intelligent Caching**: Disk-based caching using npm's `cacache` library
+- **URL Rewriting**: Automatically rewrites CDN URLs in HTML and CSS files
+- **Content Transformation**: Handles gzip/deflate compression transparently
+- **Stale-While-Revalidate**: Serves cached content while updating in background
+- **Cache Warming**: Pre-fetch resources with recursive dependency resolution
+- **Express Middleware**: Easy integration with Express applications
+- **CLI Commands**: Programmatic cache management (clear, warm, list, info)
+- **Configurable**: Callback-based CDN detection for maximum flexibility
+
+## Installation
+
+```bash
+bun add cdn-proxy-cache
+```
+
+## Quick Start
+
+### Basic Usage
+
+```typescript
+import express from 'express';
+import { createProxyCache } from 'cdn-proxy-cache';
+
+const app = express();
+
+// Create a proxy cache instance
+const cache = createProxyCache({
+  proxyPrefix: '/__proxy_cache',
+  cachePath: '~/.cache/my-app',
+  cacheSeeds: [
+    'https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js',
+  ],
+  shouldProxyPath: (url) => {
+    // Define which URLs should be proxied
+    return url.includes('cdn.jsdelivr.net') || url.includes('cdnjs.cloudflare.com');
+  },
+});
+
+// Mount the proxy router
+app.use(cache.proxyPrefix, cache.router);
+
+// Rewrite HTML to use cached URLs
+app.get('/', (req, res) => {
+  const html = `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <script src="https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js"></script>
+      </head>
+      <body>
+        <h1>Hello World</h1>
+      </body>
+    </html>
+  `;
+  res.send(cache.replaceUrlsInHtml(html));
+});
+
+app.listen(3000, () => {
+  console.log('Server running on http://localhost:3000');
+});
+```
+
+### With Cache Warming
+
+```typescript
+// Warm the cache at startup
+await cache.warm({ force: false }, (message) => {
+  if (message.type === 'progress') {
+    console.log(`Cached ${message.stats.total} resources`);
+  }
+});
+```
+
+## API Reference
+
+### `createProxyCache(options)`
+
+Creates a new proxy cache instance.
+
+**Options:**
+
+- `proxyPrefix` (string): URL prefix for proxied resources (e.g., `'/__proxy_cache'`)
+- `cachePath` (string): Local directory for cache storage
+- `cacheSeeds` (string[]): URLs to pre-fetch when warming the cache
+- `shouldProxyPath` (function): Callback to determine if a URL should be proxied
+  - Signature: `(url: string) => boolean`
+  - Return `true` to proxy the URL, `false` to pass through
+
+**Returns:** `ProxyCache` instance with the following methods:
+
+#### `cache.router(req, res)`
+
+Express middleware that handles proxy requests. Mount this at the `proxyPrefix` path.
+
+```typescript
+app.use(cache.proxyPrefix, cache.router);
+```
+
+#### `cache.replaceUrlsInHtml(html)`
+
+Rewrites CDN URLs in HTML `<script src>` and `<link href>` attributes to use the proxy.
+
+```typescript
+const rewrittenHtml = cache.replaceUrlsInHtml(originalHtml);
+```
+
+#### `cache.warm(options, callback?)`
+
+Pre-fetches resources into the cache.
+
+**Options:**
+- `force` (boolean): Re-fetch even if already cached
+- `reload` (boolean): Re-fetch all currently cached items (requires `force: true`)
+
+**Callback:** Receives progress messages:
+- `{ type: 'initial', total: number }` - Cache warming started
+- `{ type: 'prefetch', url: string }` - Fetching a URL
+- `{ type: 'progress', stats: CacheWarmStats }` - Progress update
+- `{ type: 'error', url: string, status: number }` - Fetch failed
+
+**Returns:** Promise<CacheWarmStats>
+
+```typescript
+const stats = await cache.warm({ force: false }, (msg) => {
+  if (msg.type === 'prefetch') {
+    console.log(`Fetching: ${msg.url}`);
+  }
+});
+console.log(`Cached ${stats.total} resources (${stats.hits} hits, ${stats.misses} misses)`);
+```
+
+#### `cache.clear()`
+
+Clears all cached entries.
+
+```typescript
+await cache.clear();
+```
+
+#### `cache.ls()`
+
+Lists all cached entries. Returns cacache's `ls()` result.
+
+```typescript
+const entries = await cache.ls();
+for (const [key, entry] of Object.entries(entries)) {
+  console.log(entry.metadata.originUrl);
+}
+```
+
+#### `cache.isProxyPath(url)`
+
+Checks if a URL is a proxy path.
+
+```typescript
+cache.isProxyPath('/__proxy_cache/cdn.jsdelivr.net/...') // true
+```
+
+#### `cache.encodeProxyPath(url)` / `cache.decodeProxyPath(path, query?)`
+
+URL encoding/decoding utilities (primarily for testing).
+
+## CLI Commands
+
+The library exports command functions that can be integrated into your application's CLI:
+
+```typescript
+import { clearCache, warmCache, listCache, showCacheInfo } from 'cdn-proxy-cache';
+
+// Clear the cache
+await clearCache(cache);
+
+// Warm the cache
+await warmCache(cache, { force: false, verbose: true });
+
+// List cached entries
+await listCache(cache, { json: false, verbose: true });
+
+// Show cache info
+await showCacheInfo(cache); // Overall stats
+await showCacheInfo(cache, 'https://cdn.jsdelivr.net/...'); // Specific entry
+```
+
+### Integrating with Commander.js
+
+```typescript
+import { program } from 'commander';
+import { clearCache, warmCache, listCache, showCacheInfo } from 'cdn-proxy-cache';
+
+program
+  .command('cache:clear')
+  .description('Clear the proxy cache')
+  .action(() => clearCache(cache));
+
+program
+  .command('cache:warm')
+  .description('Warm the proxy cache')
+  .option('-f, --force', 'Re-fetch all resources')
+  .option('-v, --verbose', 'Verbose output')
+  .action((options) => warmCache(cache, options));
+
+program
+  .command('cache:ls')
+  .description('List cached entries')
+  .option('--json', 'Output as JSON')
+  .option('-v, --verbose', 'Show detailed information')
+  .action((options) => listCache(cache, options));
+
+program
+  .command('cache:info [url]')
+  .description('Show cache information')
+  .action((url) => showCacheInfo(cache, url));
+```
+
+## Development
+
+### Build
+
+```bash
+bun run build
+```
+
+Compiles TypeScript to the `dist/` directory.
+
+### Test
+
+```bash
+bun test
+```
+
+Runs the test suite using Bun's built-in test runner.
+
+### Type Checking
+
+```bash
+bun run typecheck
+```
+
+Runs TypeScript compiler in check mode (no output).
+
+### Linting and Formatting
+
+```bash
+bun run lint      # Check code style
+bun run format    # Auto-format code
+```
+
+Uses Biome for fast linting and formatting.
+
+### All Checks
+
+```bash
+bun run check
+```
+
+Runs format, lint, typecheck, and tests in sequence.
+
+## How It Works
+
+### Caching Strategy
+
+1. **Request Interception**: The proxy intercepts requests to CDN URLs
+2. **Cache Lookup**: Checks local cache using a composite key (URL + accept headers)
+3. **Cache Hit**: Returns cached response with proper headers (`Age`, `Cache-Control`)
+4. **Cache Miss**: Fetches from origin, stores in cache, and streams to client
+5. **Expiration**: Uses `max-age`/`s-maxage` directives; serves stale content while revalidating
+
+### URL Encoding
+
+CDN URLs are transformed to proxy paths:
+
+```
+https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js
+↓
+/__proxy_cache/cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js
+```
+
+Query parameters are packaged into a single `?search=` parameter to avoid cache fragmentation.
+
+### Content Rewriting
+
+- **HTML**: Rewrites `<script src>` and `<link href>` attributes
+- **CSS**: Parses and rewrites `url()` references using css-tree
+- **Compression**: Transparently handles gzip/deflate encoding
+
+### Stream Processing
+
+The proxy uses stream multiplexing to:
+1. Pipe response to client
+2. Write to cache simultaneously
+3. Transform content (CSS URL rewriting) on-the-fly
+
+## License
+
+MIT © Oliver Steele
+
+## Related Projects
+
+- [p5-server](https://github.com/osteele/p5-server) - The original implementation that this library was extracted from
