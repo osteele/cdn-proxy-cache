@@ -1,5 +1,5 @@
-import stream from 'stream';
-import assert from 'assert';
+import assert from 'node:assert';
+import stream from 'node:stream';
 
 /** A stream.Writable that counts the number of characters, buffer items,
  * Uint8Array items, or objects written to it. */
@@ -20,17 +20,24 @@ export class WritableCounter extends stream.Writable {
  *
  * Note: Doesn't handle chunks of type `Uint8Array`.
  */
-export async function fromReadable(stream: NodeJS.ReadableStream, emptyValue: string | Buffer = ''): Promise<string | Buffer> {
+export async function fromReadable(
+  stream: NodeJS.ReadableStream,
+  emptyValue: string | Buffer = ''
+): Promise<string | Buffer> {
   const chunks: (string | Buffer)[] = [];
   for await (const chunk of stream) {
     assert.ok(typeof chunk === 'string' || Buffer.isBuffer(chunk));
     chunks.push(chunk);
   }
-  return chunks.length === 0 ? emptyValue
-    : chunks.length === 1 ? chunks[0]
-      : chunks.every(chunk => typeof chunk === 'string') ? chunks.join('')
-        : chunks.every(chunk => chunk instanceof Buffer) ? Buffer.concat(chunks as Buffer[])
-          : Buffer.concat(chunks.map(chunk => typeof chunk === 'string' ? Buffer.from(chunk) : chunk));
+  return chunks.length === 0
+    ? emptyValue
+    : chunks.length === 1
+      ? chunks[0]
+      : chunks.every((chunk) => typeof chunk === 'string')
+        ? chunks.join('')
+        : chunks.every((chunk) => chunk instanceof Buffer)
+          ? Buffer.concat(chunks as Buffer[])
+          : Buffer.concat(chunks.map((chunk) => (typeof chunk === 'string' ? Buffer.from(chunk) : chunk)));
 }
 
 export function multiplexStreamWriter(streams: NodeJS.WritableStream[]): NodeJS.WritableStream {
@@ -57,6 +64,6 @@ export function multiplexStreamWriter(streams: NodeJS.WritableStream[]): NodeJS.
           }
         });
       }
-    }
+    },
   });
 }

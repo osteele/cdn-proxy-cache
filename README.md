@@ -1,5 +1,11 @@
 # cdn-proxy-cache
 
+[![CI](https://github.com/osteele/cdn-proxy-cache/workflows/CI/badge.svg)](https://github.com/osteele/cdn-proxy-cache/actions)
+[![npm version](https://img.shields.io/npm/v/cdn-proxy-cache.svg)](https://www.npmjs.com/package/cdn-proxy-cache)
+[![Bun](https://img.shields.io/badge/Bun-000000?logo=bun&logoColor=white)](https://bun.sh)
+[![License](https://img.shields.io/npm/l/cdn-proxy-cache.svg)](LICENSE)
+[![Node Version](https://img.shields.io/node/v/cdn-proxy-cache.svg)](https://www.npmjs.com/package/cdn-proxy-cache)
+
 A caching proxy for CDN resources with URL rewriting, content transformation, and Express integration. Enables offline development by caching CDN assets locally.
 
 ## Features
@@ -221,46 +227,69 @@ program
 
 ## Development
 
-### Build
+This project uses [just](https://github.com/casey/just) as a command runner. Run `just` to see all available commands:
 
 ```bash
-bun run build
+just                # List all commands
+just install        # Install dependencies
+just check          # Run all checks (format, lint, typecheck, test)
+just build          # Build the project
+just test           # Run tests
+just test-watch     # Run tests in watch mode
+just format         # Auto-format code
+just lint           # Run linting
+just typecheck      # Type check
+just fix            # Fix formatting and linting issues
+just clean          # Clean build artifacts
+just prepublish     # Prepare for publishing
 ```
 
-Compiles TypeScript to the `dist/` directory.
+### Common Tasks
 
-### Test
+**Setup:**
+```bash
+bun install
+# or
+just install
+```
+
+**Run all checks:**
+```bash
+just check
+# Runs: format, lint, typecheck, and test
+```
+
+**Build:**
+```bash
+just build
+# Compiles TypeScript to the dist/ directory
+```
+
+**Test:**
+```bash
+just test           # Run once
+just test-watch     # Watch mode
+```
+
+**Development workflow:**
+```bash
+# Make changes, then run:
+just fix            # Auto-fix formatting and linting
+just check          # Verify everything passes
+```
+
+### Direct npm/bun Commands
+
+You can also use npm/bun scripts directly:
 
 ```bash
-bun test
+bun run check       # Run all checks
+bun run build       # Build
+bun test            # Test
+bun run typecheck   # Type check
+bun run lint        # Lint
+bun run format      # Format
 ```
-
-Runs the test suite using Bun's built-in test runner.
-
-### Type Checking
-
-```bash
-bun run typecheck
-```
-
-Runs TypeScript compiler in check mode (no output).
-
-### Linting and Formatting
-
-```bash
-bun run lint      # Check code style
-bun run format    # Auto-format code
-```
-
-Uses Biome for fast linting and formatting.
-
-### All Checks
-
-```bash
-bun run check
-```
-
-Runs format, lint, typecheck, and tests in sequence.
 
 ## How It Works
 

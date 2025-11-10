@@ -1,9 +1,9 @@
-import { describe, test, expect } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
+import os from 'node:os';
+import path from 'node:path';
+import stream from 'node:stream';
+import zlib from 'node:zlib';
 import { createProxyCache } from '../src/proxyCache';
-import zlib from 'zlib';
-import stream from 'stream';
-import os from 'os';
-import path from 'path';
 
 // Helper function to determine if a URL should be proxied (simple CDN detection for tests)
 function isCdnUrl(url: string): boolean {
@@ -23,15 +23,13 @@ describe('CDN Proxy', () => {
 
   describe('encodeProxyPath', () => {
     test('encodes CDN URL', () => {
-      expect(
-        encodeProxyPath('https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js')
-      ).toBe('/__proxy_cache/cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js');
+      expect(encodeProxyPath('https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js')).toBe(
+        '/__proxy_cache/cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js'
+      );
     });
 
     test('ignores relative URLs', () => {
-      expect(encodeProxyPath('/npm/p5@1.4.0/lib/p5.min.js')).toBe(
-        '/npm/p5@1.4.0/lib/p5.min.js'
-      );
+      expect(encodeProxyPath('/npm/p5@1.4.0/lib/p5.min.js')).toBe('/npm/p5@1.4.0/lib/p5.min.js');
     });
 
     test('ignores other schemas', () => {
@@ -41,22 +39,16 @@ describe('CDN Proxy', () => {
     });
 
     test('encodes query parameters', () => {
-      expect(
-        encodeProxyPath('https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js?a=1&b=2')
-      ).toBe(
+      expect(encodeProxyPath('https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js?a=1&b=2')).toBe(
         '/__proxy_cache/cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js?search=a%3D1%26b%3D2'
       );
     });
 
     test('preserves hashes', () => {
-      expect(
-        encodeProxyPath('https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js#hash')
-      ).toBe('/__proxy_cache/cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js#hash');
-      expect(
-        encodeProxyPath(
-          'https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js?a=1&b=2#hash'
-        )
-      ).toBe(
+      expect(encodeProxyPath('https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js#hash')).toBe(
+        '/__proxy_cache/cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js#hash'
+      );
+      expect(encodeProxyPath('https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js?a=1&b=2#hash')).toBe(
         '/__proxy_cache/cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js?search=a%3D1%26b%3D2#hash'
       );
     });
@@ -65,24 +57,19 @@ describe('CDN Proxy', () => {
   describe('decodeProxyPath', () => {
     function testRoundtripEquality(originUrl: string) {
       const encodedPath = encodeProxyPath(originUrl);
-      let pathWithoutQuery = encodedPath;
-      let query = {};
+      const pathWithoutQuery = encodedPath;
+      const query = {};
       expect(decodeProxyPath(pathWithoutQuery, query)).toBe(originUrl);
     }
 
-    test('decodes CDN URL', () =>
-      testRoundtripEquality('https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js'));
+    test('decodes CDN URL', () => testRoundtripEquality('https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js'));
 
     test('decodes query parameters', () =>
-      testRoundtripEquality(
-        'https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js?a=1&b=2'
-      ));
+      testRoundtripEquality('https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js?a=1&b=2'));
 
     test('preserves hashes', () => {
       testRoundtripEquality('https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js#hash');
-      testRoundtripEquality(
-        'https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js?a=1&b=2#hash'
-      );
+      testRoundtripEquality('https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js?a=1&b=2#hash');
     });
 
     test('preserves scheme', () => {
@@ -146,7 +133,7 @@ describe('CDN Proxy', () => {
         read() {
           this.push(compressedData);
           this.push(null);
-        }
+        },
       });
 
       // Create a minimal implementation of the makeProxyReplacementStream function
@@ -175,7 +162,7 @@ describe('CDN Proxy', () => {
                   'url("/__proxy_cache/cdn.jsdelivr.net/'
                 );
                 callback(null, transformedCss);
-              }
+              },
             });
 
             // Connect the streams in the correct order
@@ -190,17 +177,13 @@ describe('CDN Proxy', () => {
       }
 
       // Process the stream
-      const outputStream = testProxyReplacement(
-        inputStream,
-        'text/css',
-        'deflate'
-      );
+      const outputStream = testProxyReplacement(inputStream, 'text/css', 'deflate');
 
       // Collect the output
       const chunks: Buffer[] = [];
-      outputStream.on('data', chunk => chunks.push(chunk));
+      outputStream.on('data', (chunk) => chunks.push(chunk));
 
-      await new Promise(resolve => outputStream.on('end', resolve));
+      await new Promise((resolve) => outputStream.on('end', resolve));
 
       try {
         // Inflate the result to check if it's properly processed
@@ -286,13 +269,13 @@ describe('CDN Proxy', () => {
               read() {
                 this.push(compressedData);
                 this.push(null);
-              }
+              },
             });
 
             // CORRECT order: first inflate (decompress), then transform, then deflate (compress)
-            const inflateStream = zlib.createInflate();  // First decompress
+            const inflateStream = zlib.createInflate(); // First decompress
             const transformStream = new stream.PassThrough(); // Process content
-            const deflateStream = zlib.createDeflate();  // Re-compress
+            const deflateStream = zlib.createDeflate(); // Re-compress
 
             // Connect the streams in the correct order
             inputStream.pipe(inflateStream);
@@ -301,7 +284,7 @@ describe('CDN Proxy', () => {
 
             // Collect the output
             const chunks: Buffer[] = [];
-            deflateStream.on('data', chunk => chunks.push(chunk));
+            deflateStream.on('data', (chunk) => chunks.push(chunk));
             deflateStream.on('end', () => {
               const output = Buffer.concat(chunks);
               streamResolve(output);
@@ -317,7 +300,7 @@ describe('CDN Proxy', () => {
               read() {
                 this.push(compressedData);
                 this.push(null);
-              }
+              },
             });
 
             // INCORRECT order: using inflate/deflate in wrong positions
@@ -330,7 +313,7 @@ describe('CDN Proxy', () => {
 
             // Collect the output
             const chunks: Buffer[] = [];
-            inflateStream.on('data', chunk => chunks.push(chunk));
+            inflateStream.on('data', (chunk) => chunks.push(chunk));
             inflateStream.on('end', () => {
               const output = Buffer.concat(chunks);
               streamResolve(output);
@@ -341,32 +324,31 @@ describe('CDN Proxy', () => {
 
         // Run both implementations and compare results
         Promise.all([
-          processWithIncorrectStreamOrder(compressedCSS)
-            .catch(() => Buffer.from('error-occurred')), // Handle expected error
-          processWithCorrectStreamOrder(compressedCSS)
+          processWithIncorrectStreamOrder(compressedCSS).catch(() => Buffer.from('error-occurred')), // Handle expected error
+          processWithCorrectStreamOrder(compressedCSS),
         ])
-        .then(([incorrectOutput, correctOutput]) => {
-          try {
-            // With the incorrect stream order, we should get corrupted data
+          .then(([incorrectOutput, correctOutput]) => {
             try {
-              const incorrectDecoded = zlib.inflateSync(incorrectOutput as Buffer).toString();
-              // If we got here, the output should still be different from the original
-              expect(incorrectDecoded).not.toBe(originalCSS);
-            } catch (e) {
-              // Expected error is fine
+              // With the incorrect stream order, we should get corrupted data
+              try {
+                const incorrectDecoded = zlib.inflateSync(incorrectOutput as Buffer).toString();
+                // If we got here, the output should still be different from the original
+                expect(incorrectDecoded).not.toBe(originalCSS);
+              } catch (e) {
+                // Expected error is fine
+              }
+
+              // With the correct stream order, we should get valid data that
+              // correctly decompresses to the original
+              const correctDecoded = zlib.inflateSync(correctOutput as Buffer).toString();
+              expect(correctDecoded).toBe(originalCSS);
+
+              resolve();
+            } catch (error) {
+              reject(error);
             }
-
-            // With the correct stream order, we should get valid data that
-            // correctly decompresses to the original
-            const correctDecoded = zlib.inflateSync(correctOutput as Buffer).toString();
-            expect(correctDecoded).toBe(originalCSS);
-
-            resolve();
-          } catch (error) {
-            reject(error);
-          }
-        })
-        .catch(reject);
+          })
+          .catch(reject);
       });
     });
   });

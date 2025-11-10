@@ -35,8 +35,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check src tests",
     "format": "biome format --write src tests",
-    "check": "bun run format && bun run lint && bun run typecheck && bun test",
-    "prepublishOnly": "bun run check && bun run build"
+    "format-check": "biome ci src tests",
+    "prepublishOnly": "bun run format-check && bun run lint && bun run typecheck && bun test && bun run build"
   },
   "dependencies": {
     "cacache": "^15.3.0",

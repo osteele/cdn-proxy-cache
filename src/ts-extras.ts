@@ -10,13 +10,9 @@
 const { toString } = Object.prototype;
 
 // Modified from the original to add optional `code` property.
-export function assertError(
-  value: unknown
-): asserts value is Error & { code?: string } {
+export function assertError(value: unknown): asserts value is Error & { code?: string } {
   if (!(value instanceof Error || toString.call(value) === '[object Error]')) {
-    throw new TypeError(
-      `Expected an \`Error\`, got \`${JSON.stringify(value)}\` (${typeof value})`
-    );
+    throw new TypeError(`Expected an \`Error\`, got \`${JSON.stringify(value)}\` (${typeof value})`);
   }
 }
 

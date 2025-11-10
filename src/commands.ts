@@ -1,6 +1,6 @@
+import path from 'node:path';
 import nunjucks from 'nunjucks';
-import path from 'path';
-import { ProxyCache } from './proxyCache';
+import type { ProxyCache } from './proxyCache';
 
 function configureNunjucks() {
   nunjucks.configure(path.join(__dirname, 'templates'), { autoescape: false });
@@ -8,7 +8,7 @@ function configureNunjucks() {
 
 export async function clearCache(cache: ProxyCache): Promise<void> {
   let count = 0;
-  await cache.ls().then(cacheData => {
+  await cache.ls().then((cacheData) => {
     count = Object.keys(cacheData).length;
   });
   await cache.clear();
@@ -50,9 +50,7 @@ export async function warmCache(
     process.exit(1);
   }
   console.log(
-    misses > 0
-      ? `Added ${misses} entries, for a total of ${total}`
-      : `All ${total} entries were already in the cache`
+    misses > 0 ? `Added ${misses} entries, for a total of ${total}` : `All ${total} entries were already in the cache`
   );
 }
 
@@ -77,10 +75,10 @@ export async function showCacheInfo(cache: ProxyCache, urlOrPath?: string): Prom
   configureNunjucks();
   const cacheData = await cache.ls();
   if (urlOrPath) {
-    const originUrl = isProxyUrl(cache, urlOrPath) ?
-      cache.decodeProxyPath(new URL(urlOrPath).pathname)
-      : urlOrPath;
-    const entries = Object.entries(cacheData).map(entryToObject).filter(entry => entry.originUrl === originUrl);
+    const originUrl = isProxyUrl(cache, urlOrPath) ? cache.decodeProxyPath(new URL(urlOrPath).pathname) : urlOrPath;
+    const entries = Object.entries(cacheData)
+      .map(entryToObject)
+      .filter((entry) => entry.originUrl === originUrl);
     for (const entry of entries) {
       console.log(JSON.stringify(entry, null, 2));
     }
@@ -90,15 +88,12 @@ export async function showCacheInfo(cache: ProxyCache, urlOrPath?: string): Prom
   } else {
     const entries = Object.values(cacheData);
     const totalSize = entries.reduce((acc, entry) => acc + entry.size, 0);
-    const oldest = entries.reduce(
-      (acc, entry) => Math.min(acc, entry.time),
-      Number.MAX_SAFE_INTEGER
-    );
+    const oldest = entries.reduce((acc, entry) => Math.min(acc, entry.time), Number.MAX_SAFE_INTEGER);
     const info = {
       entries,
       totalSize,
       proxyCachePath: cache.cachePath,
-      oldest: oldest < Number.MAX_SAFE_INTEGER ? new Date(oldest) : null
+      oldest: oldest < Number.MAX_SAFE_INTEGER ? new Date(oldest) : null,
     };
     process.stdout.write(nunjucks.render('proxy-cache-info.njk', info));
   }
@@ -130,7 +125,5 @@ function entryToObject([key, value]: [string, any]) {
 
 function isProxyUrl(cache: ProxyCache, url: string) {
   const u = new URL(url);
-  return u.protocol.match(/^https?/)
-    && u.hostname.match(/^localhost|127\.0\.0\.1$/)
-    && cache.isProxyPath(u.pathname);
+  return u.protocol.match(/^https?/) && u.hostname.match(/^localhost|127\.0\.0\.1$/) && cache.isProxyPath(u.pathname);
 }
