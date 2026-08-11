@@ -35,11 +35,12 @@ jobs:
         run: bun run build
 
   compatibility:
-    name: Build (Node.js ${{ matrix.node-version }})
+    name: Package (Node.js ${{ matrix.node-version }}, Express ${{ matrix.express-version }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [18.x, 20.x, 22.x]
+        node-version: [18.x, 20.x, 22.x, 24.x, 26.x]
+        express-version: [4, 5]
     steps:
       - uses: actions/checkout@v4
 
@@ -55,3 +56,14 @@ jobs:
 
       - name: Type check
         run: npm run typecheck
+
+      - name: Pack
+        run: npm pack --pack-destination "$RUNNER_TEMP"
+
+      - name: Install and load packed package
+        run: |
+          mkdir "$RUNNER_TEMP/consumer"
+          cd "$RUNNER_TEMP/consumer"
+          npm init --yes
+          npm install "$RUNNER_TEMP"/cdn-proxy-cache-*.tgz "express@${{ matrix.express-version }}"
+          node -e "const express = require('express'); const { createProxyCache } = require('cdn-proxy-cache'); const cache = createProxyCache({ proxyPrefix: '/cache', cachePath: './cache', cacheSeeds: [], shouldProxyPath: () => false }); const app = express(); app.use(cache.proxyPrefix, cache.router); console.log('packed package loaded')"
