@@ -17,6 +17,7 @@ const os = require('os');
 
 const app = express();
 const port = process.env.PORT || 3000;
+const cdnHosts = new Set(['cdn.jsdelivr.net', 'cdnjs.cloudflare.com']);
 
 // Create proxy cache instance
 const cache = createProxyCache({
@@ -27,10 +28,7 @@ const cache = createProxyCache({
     'https://cdn.jsdelivr.net/npm/jquery@3.6/dist/jquery.min.js',
     'https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css',
   ],
-  shouldProxyPath: (url) => {
-    // Proxy jsdelivr and cdnjs URLs
-    return url.includes('cdn.jsdelivr.net') || url.includes('cdnjs.cloudflare.com');
-  },
+  shouldProxyPath: (url) => /^https?:/.test(url) && cdnHosts.has(new URL(url).hostname),
 });
 
 // Mount the proxy middleware

@@ -7,11 +7,11 @@
  * "node_modules/(?!(@etc." value did not fix this.)
  */
 
-const { toString } = Object.prototype;
+const objectToString = Object.prototype.toString;
 
 // Modified from the original to add optional `code` property.
 export function assertError(value: unknown): asserts value is Error & { code?: string } {
-  if (!(value instanceof Error || toString.call(value) === '[object Error]')) {
+  if (!(value instanceof Error || objectToString.call(value) === '[object Error]')) {
     throw new TypeError(`Expected an \`Error\`, got \`${JSON.stringify(value)}\` (${typeof value})`);
   }
 }

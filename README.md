@@ -32,21 +32,21 @@ bun add cdn-proxy-cache
 ```typescript
 import express from 'express';
 import { createProxyCache } from 'cdn-proxy-cache';
+import os from 'node:os';
+import path from 'node:path';
 
 const app = express();
+const cdnHosts = new Set(['cdn.jsdelivr.net', 'cdnjs.cloudflare.com']);
 
 // Create a proxy cache instance
 const cache = createProxyCache({
   proxyPrefix: '/__proxy_cache',
-  cachePath: '~/.cache/my-app',
+  cachePath: path.join(os.homedir(), '.cache', 'my-app'),
   cacheSeeds: [
     'https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js',
     'https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js',
   ],
-  shouldProxyPath: (url) => {
-    // Define which URLs should be proxied
-    return url.includes('cdn.jsdelivr.net') || url.includes('cdnjs.cloudflare.com');
-  },
+  shouldProxyPath: (url) => /^https?:/.test(url) && cdnHosts.has(new URL(url).hostname),
 });
 
 // Mount the proxy router

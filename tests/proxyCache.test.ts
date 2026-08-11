@@ -1,13 +1,15 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import os from 'node:os';
 import path from 'node:path';
 import stream from 'node:stream';
 import zlib from 'node:zlib';
+import { warmCache as runWarmCache, showCacheInfo } from '../src/commands';
 import { createProxyCache } from '../src/proxyCache';
 
 // Helper function to determine if a URL should be proxied (simple CDN detection for tests)
 function isCdnUrl(url: string): boolean {
-  return url.includes('cdn.jsdelivr.net') || url.includes('cdnjs.cloudflare.com');
+  if (!/^https?:/.test(url)) return false;
+  return ['cdn.jsdelivr.net', 'cdnjs.cloudflare.com'].includes(new URL(url).hostname);
 }
 
 // Create a test cache instance
@@ -75,6 +77,72 @@ describe('CDN Proxy', () => {
     test('preserves scheme', () => {
       testRoundtripEquality('https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js');
       testRoundtripEquality('http://cdn.jsdelivr.net/npm/p5@1.4.0/lib/p5.min.js');
+    });
+  });
+
+  describe('HTML rewriting', () => {
+    test('rewrites proxied scripts and stylesheets', () => {
+      const html = [
+        '<script src="https://cdn.jsdelivr.net/example.js"></script>',
+        '<script src="/local.js"></script>',
+        '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/example.css">',
+      ].join('');
+
+      expect(testCache.replaceUrlsInHtml(html)).toBe(
+        [
+          '<script src="/__proxy_cache/cdn.jsdelivr.net/example.js"></script>',
+          '<script src="/local.js"></script>',
+          '<link rel="stylesheet" href="/__proxy_cache/cdnjs.cloudflare.com/example.css">',
+        ].join('')
+      );
+    });
+  });
+
+  describe('cache commands', () => {
+    test('accepts a relative proxy path when showing cache info', async () => {
+      const consoleLog = spyOn(console, 'log').mockImplementation(() => {});
+      try {
+        await showCacheInfo(testCache, '/__proxy_cache/cdn.jsdelivr.net/example.js');
+        expect(consoleLog).toHaveBeenCalledWith('No entry found for /__proxy_cache/cdn.jsdelivr.net/example.js');
+      } finally {
+        consoleLog.mockRestore();
+      }
+    });
+
+    test('rejects instead of terminating the process when warming fails', async () => {
+      const failingCache = {
+        ...testCache,
+        warm: async () => ({ total: 2, failures: 1, hits: 0, misses: 1 }),
+      };
+
+      await expect(runWarmCache(failingCache, { verbose: true })).rejects.toThrow(
+        'Failed to fetch 1 of 2 cache entries'
+      );
+    });
+  });
+
+  describe('router security', () => {
+    test('refuses URLs rejected by shouldProxyPath', async () => {
+      const response = new (class extends stream.Writable {
+        body = '';
+        statusCode = 200;
+
+        setHeader() {}
+        send(chunk: string | Buffer) {
+          this.body += chunk.toString();
+        }
+        status(code: number) {
+          this.statusCode = code;
+        }
+        _write(_chunk: unknown, _encoding: BufferEncoding, callback: () => void) {
+          callback();
+        }
+      })();
+
+      await testCache.router({ headers: {}, path: 'internal.example/secret', query: {} }, response);
+
+      expect(response.statusCode).toBe(403);
+      expect(response.body).toBe('Refusing to proxy URL: https://internal.example/secret');
     });
   });
 
@@ -185,17 +253,13 @@ describe('CDN Proxy', () => {
 
       await new Promise((resolve) => outputStream.on('end', resolve));
 
-      try {
-        // Inflate the result to check if it's properly processed
-        const output = Buffer.concat(chunks);
-        const decompressed = zlib.inflateSync(output).toString();
+      // Inflate the result to check if it's properly processed
+      const output = Buffer.concat(chunks);
+      const decompressed = zlib.inflateSync(output).toString();
 
-        // Verify the CSS was properly transformed and the URL was replaced
-        expect(decompressed).toContain('/__proxy_cache/cdn.jsdelivr.net/');
-        expect(decompressed).not.toContain('https://cdn.jsdelivr.net/');
-      } catch (err: any) {
-        throw new Error(`Stream processing failed: ${err.message}`);
-      }
+      // Verify the CSS was properly transformed and the URL was replaced
+      expect(decompressed).toContain('/__proxy_cache/cdn.jsdelivr.net/');
+      expect(decompressed).not.toContain('https://cdn.jsdelivr.net/');
     });
 
     test('decompression functions must be correctly paired with compression type', () => {

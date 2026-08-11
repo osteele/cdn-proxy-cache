@@ -13,6 +13,7 @@ const { program } = require('commander');
 const { createProxyCache, clearCache, warmCache, listCache, showCacheInfo } = require('cdn-proxy-cache');
 const path = require('path');
 const os = require('os');
+const cdnHosts = new Set(['cdn.jsdelivr.net', 'cdnjs.cloudflare.com']);
 
 // Create proxy cache instance
 const cache = createProxyCache({
@@ -23,9 +24,7 @@ const cache = createProxyCache({
     'https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.css',
     'https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js',
   ],
-  shouldProxyPath: (url) => {
-    return url.includes('cdn.jsdelivr.net') || url.includes('cdnjs.cloudflare.com');
-  },
+  shouldProxyPath: (url) => /^https?:/.test(url) && cdnHosts.has(new URL(url).hostname),
 });
 
 // Define CLI

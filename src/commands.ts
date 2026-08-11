@@ -47,7 +47,7 @@ export async function warmCache(
   }
   const { total, failures, misses } = stats;
   if (failures > 0) {
-    process.exit(1);
+    throw new Error(`Failed to fetch ${failures} of ${total} cache entries`);
   }
   console.log(
     misses > 0 ? `Added ${misses} entries, for a total of ${total}` : `All ${total} entries were already in the cache`
@@ -75,7 +75,10 @@ export async function showCacheInfo(cache: ProxyCache, urlOrPath?: string): Prom
   configureNunjucks();
   const cacheData = await cache.ls();
   if (urlOrPath) {
-    const originUrl = isProxyUrl(cache, urlOrPath) ? cache.decodeProxyPath(new URL(urlOrPath).pathname) : urlOrPath;
+    const proxyUrl = getProxyUrl(cache, urlOrPath);
+    const originUrl = proxyUrl
+      ? cache.decodeProxyPath(proxyUrl.pathname, Object.fromEntries(proxyUrl.searchParams))
+      : urlOrPath;
     const entries = Object.entries(cacheData)
       .map(entryToObject)
       .filter((entry) => entry.originUrl === originUrl);
@@ -99,9 +102,16 @@ export async function showCacheInfo(cache: ProxyCache, urlOrPath?: string): Prom
   }
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function entryToObject([key, value]: [string, any]) {
-  const cacheControl = value.metadata.headers['cache-control'];
+type CacheEntry = Awaited<ReturnType<ProxyCache['ls']>>[string];
+type CacheMetadata = {
+  headers: Record<string, string>;
+  originUrl: string;
+  status: number;
+};
+
+function entryToObject([key, value]: [string, CacheEntry]) {
+  const metadata = value.metadata as CacheMetadata;
+  const cacheControl = metadata.headers['cache-control'];
   const maxAge = (cacheControl?.match(/(?:^|\b)s-maxage=(\d+)/) || cacheControl?.match(/(?:^|\b)max-age=(\d+)/))?.[1];
   const expires = maxAge ? new Date(value.time + Number(maxAge) * 1000) : null;
   const requestHeaders = { ...JSON.parse(key), url: undefined };
@@ -110,7 +120,7 @@ function entryToObject([key, value]: [string, any]) {
 
     // inline metadata
     metadata: undefined,
-    ...value.metadata,
+    ...metadata,
 
     // replace time (number) by created (Date)
     time: undefined,
@@ -123,7 +133,8 @@ function entryToObject([key, value]: [string, any]) {
   };
 }
 
-function isProxyUrl(cache: ProxyCache, url: string) {
-  const u = new URL(url);
-  return u.protocol.match(/^https?/) && u.hostname.match(/^localhost|127\.0\.0\.1$/) && cache.isProxyPath(u.pathname);
+function getProxyUrl(cache: ProxyCache, url: string): URL | null {
+  const parsedUrl = new URL(url, 'http://localhost');
+  const isLocal = parsedUrl.hostname === 'localhost' || parsedUrl.hostname === '127.0.0.1';
+  return /^https?:$/.test(parsedUrl.protocol) && isLocal && cache.isProxyPath(parsedUrl.pathname) ? parsedUrl : null;
 }

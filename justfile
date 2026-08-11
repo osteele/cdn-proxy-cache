@@ -8,7 +8,7 @@ install:
 
 # Run all checks (format-check, lint, typecheck, test)
 check:
-    bun run format-check && bun run lint && bun run typecheck && bun test
+    bun run check
 
 # Build the project
 build:
@@ -40,7 +40,7 @@ format-check:
 
 # Fix formatting and linting issues
 fix:
-    bun run format && bun run lint
+    bun run fix
 
 # Clean build artifacts
 clean:
