@@ -1,4 +1,5 @@
 import express = require('express');
+
 import stream, { Readable } from 'node:stream';
 import zlib from 'node:zlib';
 import * as cacache from 'cacache';
@@ -6,8 +7,9 @@ import * as csstree from 'css-tree';
 import { parse as parseCss } from 'css-tree';
 import fetch from 'node-fetch';
 import { parse as parseHtml } from 'node-html-parser';
-import { WritableCounter, fromReadable, multiplexStreamWriter } from './helpers/stream-helpers';
+import { fromReadable, multiplexStreamWriter, WritableCounter } from './helpers/stream-helpers';
 import { isDefined } from './ts-extras';
+
 import path = require('node:path');
 import assert = require('node:assert');
 
@@ -225,7 +227,7 @@ export function createProxyCache({
       }
       // Add the Age and Cache-Control headers.
       {
-        const age = Math.max(0, +new Date() - cacheObject.time);
+        const age = Math.max(0, Date.now() - cacheObject.time);
         targetResponse.setHeader('age', Math.floor(age / 1000));
       }
       {
@@ -429,7 +431,7 @@ export function createProxyCache({
     };
 
     const res = new (class extends stream.Writable {
-      chunks = new Array<Buffer>();
+      chunks = [] as Buffer[];
       headers: Record<string, string> = {};
       statusCode?: number;
 
