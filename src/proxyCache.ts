@@ -12,6 +12,7 @@ import path = require('node:path');
 import assert = require('node:assert');
 
 const debug = require('debug')('cdn-proxy-cache');
+const MAX_REDIRECTS = 20;
 
 //#region exported types
 export type ProxyCacheOptions = {
@@ -40,6 +41,15 @@ export type ProxyCache = {
   // private methods; exported for unit testing
   decodeProxyPath: (url: string, query?: RequestI['query']) => string;
   encodeProxyPath: (url: string) => string;
+  _testing: {
+    decodeContent: typeof decodeContent;
+    makeProxyReplacementStream: (
+      stream: NodeJS.ReadableStream,
+      contentType: string,
+      contentEncoding: string,
+      base: string
+    ) => NodeJS.ReadableStream;
+  };
 };
 
 type WarmCacheOptions = {
@@ -112,6 +122,7 @@ export interface RequestI {
 
 /** The express.Response properties that cdnProxyRouter depends on. */
 export interface ResponseI extends NodeJS.WritableStream {
+  destroy(error?: Error): void;
   setHeader(key: string, value: string | number | readonly string[]): void;
   send(chunk: string | Buffer): void;
   status(code: number): void;
@@ -143,6 +154,7 @@ export function createProxyCache({
     // exported for unit testing:
     decodeProxyPath,
     encodeProxyPath,
+    _testing: { decodeContent, makeProxyReplacementStream },
   };
 
   // Note that express.Request implements RequestI, and express.Response
@@ -322,19 +334,18 @@ export function createProxyCache({
     // pipe the origin response body to both the client response and the cache
     // write stream. Collect the length of the response for logging.
     const streamLengthCounter = new WritableCounter();
-    const finishedP = Promise.all(
-      [targetResponse, cacheWriteStream, streamLengthCounter].map(
-        (w) => new Promise((resolve) => w.on('finish', resolve))
-      )
-    );
-    originResponse.body.pipe(multiplexStreamWriter([cacheWriteStream, streamLengthCounter]));
-    makeProxyReplacementStream(
-      originResponse.body,
+    const responseInput = new stream.PassThrough();
+    const originSink = multiplexStreamWriter([cacheWriteStream, streamLengthCounter, responseInput]);
+    const responseStream = makeProxyReplacementStream(
+      responseInput,
       responseHeaders['content-type'],
       responseHeaders['content-encoding'],
       originUrl
-    ).pipe(targetResponse);
-    await finishedP;
+    );
+    responseStream.on('error', (error) => targetResponse.destroy(error));
+    originResponse.body.pipe(originSink);
+    responseStream.pipe(targetResponse);
+    await Promise.all([waitForReadable(responseStream), waitForWritable(originSink), waitForWritable(targetResponse)]);
     debug('wrote', streamLengthCounter.length, 'bytes to cache for', originUrl);
   }
 
@@ -392,13 +403,18 @@ export function createProxyCache({
    * Returns a Response-like structure, that warmCache can use to follow
    * referenced URLs.
    *
-   * Follows redirections infinitely, and caches intermediate results.
+   * Follows redirections, caches intermediate results, and rejects redirect
+   * cycles or chains longer than MAX_REDIRECTS.
    *
    */
   async function prefetch(
     url: string,
-    { accept = '*/*', force = false }
+    { accept = '*/*', force = false },
+    redirectChain: readonly string[] = []
   ): Promise<{ status: number; ok: boolean; headers: Record<string, string>; data: Buffer }> {
+    if (redirectChain.includes(url) || redirectChain.length >= MAX_REDIRECTS) {
+      return { status: 508, ok: false, headers: {}, data: Buffer.alloc(0) };
+    }
     const reqHeaders = {
       accept,
       'accept-language': 'en-US,en;q=0.9',
@@ -440,7 +456,7 @@ export function createProxyCache({
     if (redirected) {
       const location = decodeProxyPath(res.headers.location);
       debug(`following redirect from ${url} -> ${location}`);
-      return prefetch(location, { accept, force });
+      return prefetch(location, { accept, force }, [...redirectChain, url]);
     }
     return {
       data: Buffer.concat(res.chunks),
@@ -513,19 +529,12 @@ export function createProxyCache({
             // add this document's URLs to the list of URLs to prefetch
             if (headers['content-type']?.startsWith('text/css') && data.length > 0) {
               const encoding = headers['content-encoding'];
-              switch (encoding) {
-                case 'deflate':
-                  data = zlib.inflateSync(data);
-                  break;
-                case 'gzip':
-                case 'x-gzip':
-                  data = zlib.gunzipSync(data);
-                  break;
-                default:
-                  if (encoding) {
-                    console.warn(`unsupported content-encoding: ${encoding}`);
-                    data = Buffer.from('');
-                  }
+              const decoded = decodeContent(data, encoding);
+              if (decoded) {
+                data = decoded;
+              } else {
+                console.warn(`unsupported content-encoding: ${encoding}`);
+                data = Buffer.alloc(0);
               }
               const base = url;
               cssForEachUrl(data.toString(), (value) => {
@@ -621,11 +630,6 @@ export function createProxyCache({
     return stream;
   }
 
-  // TODO: change this to a Duplex stream; remove the `istream` parameter.
-  //
-  // Defer this change until we drop support for Node.js v14. (This will be when
-  // VSCode moves to a more recent version of Electron, that upgrades to Node.js
-  // v16.) The implementation will become simpler at that point.
   function makeCssRewriterStream(
     istream: NodeJS.ReadableStream,
     base: string,
@@ -639,6 +643,7 @@ export function createProxyCache({
         const uz = zlib.createInflate();
         const z = zlib.createDeflate();
         const ws = makeCssRewriterStream(uz, base);
+        forwardErrors(z, [istream, uz, ws]);
         istream.pipe(uz);
         ws.pipe(z);
         return z;
@@ -649,6 +654,7 @@ export function createProxyCache({
         const uz = zlib.createGunzip();
         const z = zlib.createGzip();
         const ws = makeCssRewriterStream(uz, base);
+        forwardErrors(z, [istream, uz, ws]);
         istream.pipe(uz);
         ws.pipe(z);
         return z;
@@ -660,6 +666,7 @@ export function createProxyCache({
         }
     }
     async function* iter() {
+      // css-tree requires the complete stylesheet before it can rewrite its AST.
       const text = await fromReadable(istream);
       yield replaceUrlsInCss(text.toString());
     }
@@ -670,6 +677,38 @@ export function createProxyCache({
 //#endregion
 
 //#region helpers
+
+function decodeContent(data: Buffer, encoding?: string): Buffer | null {
+  switch (encoding) {
+    case 'deflate':
+      return zlib.inflateSync(data);
+    case 'gzip':
+    case 'x-gzip':
+      return zlib.gunzipSync(data);
+    default:
+      return encoding ? null : data;
+  }
+}
+
+function forwardErrors(destination: stream.Readable, sources: NodeJS.ReadableStream[]) {
+  for (const source of sources) {
+    source.on('error', (error) => destination.destroy(error));
+  }
+}
+
+function waitForReadable(readable: NodeJS.ReadableStream): Promise<void> {
+  return new Promise((resolve, reject) => {
+    readable.once('end', resolve);
+    readable.once('error', reject);
+  });
+}
+
+function waitForWritable(writable: NodeJS.WritableStream): Promise<void> {
+  return new Promise((resolve, reject) => {
+    writable.once('finish', resolve);
+    writable.once('error', reject);
+  });
+}
 
 /** Call `callback` for each URL in the CSS stylesheet. If `callback` returns a
  * value, replace the URL with that value. */

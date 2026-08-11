@@ -42,7 +42,7 @@ export async function fromReadable(
 
 export function multiplexStreamWriter(streams: NodeJS.WritableStream[]): NodeJS.WritableStream {
   assert.notEqual(streams.length, 0);
-  return new stream.PassThrough({
+  const writer = new stream.PassThrough({
     write(chunk, encoding, callback) {
       let error: Error | null | undefined = null;
       let count = streams.length;
@@ -66,4 +66,8 @@ export function multiplexStreamWriter(streams: NodeJS.WritableStream[]): NodeJS.
       }
     },
   });
+  for (const destination of streams) {
+    destination.on('error', (error) => writer.destroy(error));
+  }
+  return writer;
 }

@@ -6,14 +6,6 @@ It works by caching requests to known Content Delivery Network (CDN) servers, so
 
 (This feature, or a server that provides this feature, are variously referred to on the web as a *proxy cache*, a *reverse proxy cache*, a *caching proxy*, or a *web accelerator*.)
 
-Without the proxy cache:
-
-![Developer console source list, without the proxy cache](without-proxy-cache.png)
-
-With the proxy cache:
-
-![Developer console source list, with the proxy cache](with-proxy-cache.png)
-
 ## How to Use the Cache
 
 The proxy cache is designed to be integrated into web servers. To use it, users simply browse their content while connected to the internet. This loads any CDN files that are necessary into the cache. At any later point, users can view the same content without an internet connection.
@@ -27,6 +19,8 @@ The server rewrites HTML and CSS files, as they are served, to load resources fr
 In HTML documents, the `src` attributes of `script` elements, and the `href` attributes of `link` element with a `type="stylesheet"` attribute, are modified.
 
 In CSS documents, URLs that resolve to CDN resources are also rewritten. This ensures that if the HTML links to a CSS document that in turn includes other CSS documents or other assets (such as fonts or images), these assets are also cached.
+
+CSS bodies are buffered before rewriting because css-tree parses a complete stylesheet into an AST. Non-CSS response bodies remain streaming.
 
 A request for `https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js`, for example, is rewritten as a request for `/__proxy_cache/cdn.jsdelivr.net/npm/p5@1.4.0/lib/p5.min.js`. A request for `https://unpkg.com/p5.vector-arguments.min.js` is rewritten as `/__proxy_cache/unpkg.com/p5.vector-arguments.min.js`. This naming scheme makes the source list of the browser's developer console readable.
 

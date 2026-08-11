@@ -321,10 +321,12 @@ Query parameters are packaged into a single `?search=` parameter to avoid cache 
 
 ### Stream Processing
 
-The proxy uses stream multiplexing to:
+The proxy uses stream pipelines to:
 1. Pipe response to client
 2. Write to cache simultaneously
-3. Transform content (CSS URL rewriting) on-the-fly
+3. Decompress and recompress transformed content as needed
+
+CSS bodies are buffered before rewriting because css-tree parses a complete stylesheet into an AST. Other response bodies remain streaming.
 
 ## License
 
