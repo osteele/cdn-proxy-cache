@@ -44,7 +44,6 @@
     "cacache": "^19.0.1",
     "css-tree": "^3.2.1",
     "debug": "^4.4.3",
-    "express": "^5.2.1",
     "node-fetch": "^2.7.0",
     "node-html-parser": "^9.0.1",
     "nunjucks": "^3.2.4"
@@ -59,7 +58,11 @@
     "@types/node-fetch": "^2.6.13",
     "@types/nunjucks": "^3.2.6",
     "bun-types": "^1.3.14",
+    "express": "^5.2.1",
     "typescript": "^7.0.2"
+  },
+  "peerDependencies": {
+    "express": ">=4.18 <6"
   },
   "overrides": {
     "form-data": "^4.0.6"

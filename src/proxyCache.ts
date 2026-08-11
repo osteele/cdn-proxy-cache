@@ -1,13 +1,15 @@
-import express = require('express');
-
-import stream, { Readable } from 'node:stream';
-import zlib from 'node:zlib';
+import type { IncomingHttpHeaders } from 'node:http';
+import stream from 'node:stream';
 import * as cacache from 'cacache';
-import * as csstree from 'css-tree';
-import { parse as parseCss } from 'css-tree';
 import fetch from 'node-fetch';
 import { parse as parseHtml } from 'node-html-parser';
-import { fromReadable, multiplexStreamWriter, WritableCounter } from './helpers/stream-helpers';
+import { multiplexStreamWriter, WritableCounter } from './helpers/stream-helpers';
+import {
+  cssForEachUrl,
+  decodeContent,
+  makeProxyReplacementStream,
+  replaceUrlsInCss as rewriteCss,
+} from './internal/content';
 import { isDefined } from './ts-extras';
 
 import path = require('node:path');
@@ -32,6 +34,7 @@ export type ProxyCache = {
   // methods
   router: (req: RequestI, res: ResponseI) => Promise<void>;
   replaceUrlsInHtml: (html: string) => string;
+  replaceUrlsInCss: (css: string) => string;
 
   // cache management methods
   clear: () => Promise<void>;
@@ -40,18 +43,8 @@ export type ProxyCache = {
 
   isProxyPath: (url: string) => boolean;
 
-  // private methods; exported for unit testing
   decodeProxyPath: (url: string, query?: RequestI['query']) => string;
   encodeProxyPath: (url: string) => string;
-  _testing: {
-    decodeContent: typeof decodeContent;
-    makeProxyReplacementStream: (
-      stream: NodeJS.ReadableStream,
-      contentType: string,
-      contentEncoding: string,
-      base: string
-    ) => NodeJS.ReadableStream;
-  };
 };
 
 type WarmCacheOptions = {
@@ -117,9 +110,9 @@ const cacacheLsBind = () => cacache.ls('cachePath');
 
 /** The express.Request properties that cdnProxyRouter depends on. */
 export interface RequestI {
-  headers: typeof express.request.headers;
-  path: typeof express.request.path;
-  query: typeof express.request.query;
+  headers: IncomingHttpHeaders;
+  path: string;
+  query: Record<string, unknown>;
 }
 
 /** The express.Response properties that cdnProxyRouter depends on. */
@@ -150,13 +143,12 @@ export function createProxyCache({
     clear: () => cacache.rm.all(cachePath),
     router: cdnProxyRouter,
     replaceUrlsInHtml,
+    replaceUrlsInCss,
     warm: warmCache,
     ls: cacache.ls.bind(cacache, cachePath),
     isProxyPath: (url) => url.startsWith(proxyPrefix),
-    // exported for unit testing:
     decodeProxyPath,
     encodeProxyPath,
-    _testing: { decodeContent, makeProxyReplacementStream },
   };
 
   // Note that express.Request implements RequestI, and express.Response
@@ -242,7 +234,12 @@ export function createProxyCache({
 
       targetResponse.status(cacheObject.metadata.status);
       let rstream = cacache.get.stream(cachePath, cacheKey) as unknown as NodeJS.ReadableStream;
-      rstream = makeProxyReplacementStream(rstream, headers['content-type'], headers['content-encoding'], originUrl);
+      rstream = makeProxyReplacementStream(
+        rstream,
+        headers['content-type'],
+        headers['content-encoding'],
+        transformCssUrl
+      );
       rstream.pipe(targetResponse);
 
       // Check for cache expiration.
@@ -342,7 +339,7 @@ export function createProxyCache({
       responseInput,
       responseHeaders['content-type'],
       responseHeaders['content-encoding'],
-      originUrl
+      transformCssUrl
     );
     responseStream.on('error', (error) => targetResponse.destroy(error));
     originResponse.body.pipe(originSink);
@@ -605,98 +602,19 @@ export function createProxyCache({
    * @param html the HTML to process
    * @returns the processed HTML
    */
-  function replaceUrlsInCss(text: string) {
-    const stylesheet = parseCss(text);
-    let modified = false;
-
-    cssForEachUrl(stylesheet, (value) => {
-      if (value.startsWith('data:')) return;
-      if (shouldProxyPath(value)) {
-        const proxied = encodeProxyPath(value);
-        modified = true;
-        return proxied;
-      }
-    });
-    return modified ? csstree.generate(stylesheet) : text;
+  function replaceUrlsInCss(text: string): string {
+    return rewriteCss(text, transformCssUrl);
   }
 
-  function makeProxyReplacementStream(
-    stream: NodeJS.ReadableStream,
-    contentType: string,
-    contentEncoding: string,
-    base: string
-  ): NodeJS.ReadableStream {
-    if (contentType?.startsWith('text/css')) {
-      return makeCssRewriterStream(stream, base, contentEncoding);
-    }
-    return stream;
-  }
-
-  function makeCssRewriterStream(
-    istream: NodeJS.ReadableStream,
-    base: string,
-    encoding?: string
-  ): NodeJS.ReadableStream {
-    // Note that this doesn't handle nested encodings. This isn't conceptually
-    // hard, but it adds complexity and these aren't used in the wild.
-    switch (encoding) {
-      case 'deflate': {
-        // First decompress with inflate, then recompress with deflate
-        const uz = zlib.createInflate();
-        const z = zlib.createDeflate();
-        const ws = makeCssRewriterStream(uz, base);
-        forwardErrors(z, [istream, uz, ws]);
-        istream.pipe(uz);
-        ws.pipe(z);
-        return z;
-      }
-      case 'gzip':
-      case 'x-gzip': {
-        // First decompress with gunzip, then recompress with gzip
-        const uz = zlib.createGunzip();
-        const z = zlib.createGzip();
-        const ws = makeCssRewriterStream(uz, base);
-        forwardErrors(z, [istream, uz, ws]);
-        istream.pipe(uz);
-        ws.pipe(z);
-        return z;
-      }
-      default:
-        if (encoding) {
-          console.error(`unsupported content-encoding: ${encoding}`);
-          return istream;
-        }
-    }
-    async function* iter() {
-      // css-tree requires the complete stylesheet before it can rewrite its AST.
-      const text = await fromReadable(istream);
-      yield replaceUrlsInCss(text.toString());
-    }
-    return Readable.from(iter());
+  function transformCssUrl(value: string): string | undefined {
+    if (value.startsWith('data:') || !shouldProxyPath(value)) return undefined;
+    return encodeProxyPath(value);
   }
 }
 
 //#endregion
 
 //#region helpers
-
-function decodeContent(data: Buffer, encoding?: string): Buffer | null {
-  switch (encoding) {
-    case 'deflate':
-      return zlib.inflateSync(data);
-    case 'gzip':
-    case 'x-gzip':
-      return zlib.gunzipSync(data);
-    default:
-      return encoding ? null : data;
-  }
-}
-
-function forwardErrors(destination: stream.Readable, sources: NodeJS.ReadableStream[]) {
-  for (const source of sources) {
-    source.on('error', (error) => destination.destroy(error));
-  }
-}
 
 function waitForReadable(readable: NodeJS.ReadableStream): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -709,24 +627,6 @@ function waitForWritable(writable: NodeJS.WritableStream): Promise<void> {
   return new Promise((resolve, reject) => {
     writable.once('finish', resolve);
     writable.once('error', reject);
-  });
-}
-
-/** Call `callback` for each URL in the CSS stylesheet. If `callback` returns a
- * value, replace the URL with that value. */
-function cssForEachUrl(stylesheet: csstree.CssNode | string, callback: (url: string) => undefined | string) {
-  csstree.walk(typeof stylesheet === 'string' ? parseCss(stylesheet) : stylesheet, {
-    visit: 'Url',
-    enter(node) {
-      // csstree's node.value is a string, but the latest @types/css-tree (v1)
-      // declares it as a node.
-      //
-      const urlNode = node as unknown as { value: string };
-      const transformed = callback(urlNode.value);
-      if (transformed) {
-        urlNode.value = transformed;
-      }
-    },
   });
 }
 

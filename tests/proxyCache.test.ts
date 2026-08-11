@@ -8,6 +8,7 @@ import stream from 'node:stream';
 import zlib from 'node:zlib';
 import { warmCache as runWarmCache, showCacheInfo } from '../src/commands';
 import { fromReadable } from '../src/helpers/stream-helpers';
+import { decodeContent, makeProxyReplacementStream } from '../src/internal/content';
 import { createProxyCache } from '../src/proxyCache';
 
 function isCdnUrl(url: string): boolean {
@@ -146,27 +147,27 @@ describe('CDN Proxy', () => {
       test(`rewrites ${encoding}-encoded CSS through the production stream`, async () => {
         const css = Buffer.from('body { background: url("https://cdn.jsdelivr.net/asset.png"); }');
         const compressed = encoding === 'deflate' ? zlib.deflateSync(css) : zlib.gzipSync(css);
-        const outputStream = testCache._testing.makeProxyReplacementStream(
+        const outputStream = makeProxyReplacementStream(
           stream.Readable.from(compressed),
           'text/css',
           encoding,
-          'https://cdn.jsdelivr.net/style.css'
+          (url) => (isCdnUrl(url) ? testCache.encodeProxyPath(url) : undefined)
         );
         const output = await fromReadable(outputStream);
         if (!Buffer.isBuffer(output)) throw new TypeError('Expected a Buffer');
 
-        const decoded = testCache._testing.decodeContent(output, encoding);
+        const decoded = decodeContent(output, encoding);
         expect(decoded?.toString()).toContain('/__proxy_cache/cdn.jsdelivr.net/asset.png');
-        expect(testCache._testing.decodeContent(compressed, encoding)?.toString()).toBe(css.toString());
+        expect(decodeContent(compressed, encoding)?.toString()).toBe(css.toString());
       });
     }
 
     test('propagates compressed CSS stream errors', async () => {
-      const outputStream = testCache._testing.makeProxyReplacementStream(
+      const outputStream = makeProxyReplacementStream(
         stream.Readable.from('not deflate data'),
         'text/css',
         'deflate',
-        'https://cdn.jsdelivr.net/style.css'
+        () => undefined
       );
       await expect(fromReadable(outputStream)).rejects.toThrow();
     });
