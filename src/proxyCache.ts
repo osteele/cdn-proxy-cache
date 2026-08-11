@@ -4,6 +4,7 @@ import * as cacache from 'cacache';
 import fetch from 'node-fetch';
 import { parse as parseHtml } from 'node-html-parser';
 import { multiplexStreamWriter, WritableCounter } from './helpers/stream-helpers';
+import { cacheLifetimeSeconds, canStoreSharedResponse, parseCacheControl } from './internal/cache-control';
 import {
   cssForEachUrl,
   decodeContent,
@@ -17,14 +18,33 @@ import assert = require('node:assert');
 
 const debug = require('debug')('cdn-proxy-cache');
 const MAX_REDIRECTS = 20;
+const DEFAULT_MAX_CSS_TRANSFORM_BYTES = 5 * 1024 * 1024;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_WARM_CONCURRENCY = 20;
 
 //#region exported types
 export type ProxyCacheOptions = {
   cachePath: string;
   cacheSeeds: string[];
+  /** Maximum decompressed CSS size that may be buffered for rewriting. */
+  maxCssTransformBytes?: number;
+  /** Receives structured cache lifecycle events. */
+  onEvent?: (event: ProxyCacheEvent) => void;
   proxyPrefix: string;
+  /** Maximum time for an origin request, including streaming its body. */
+  requestTimeoutMs?: number;
   shouldProxyPath: (url: string) => boolean;
+  /** Default maximum number of concurrent cache-warming requests. */
+  warmConcurrency?: number;
 };
+
+export type ProxyCacheEvent =
+  | { type: 'request'; url: string }
+  | { type: 'cache-hit'; url: string; stale: boolean }
+  | { type: 'cache-miss'; url: string }
+  | { type: 'cache-write'; url: string; bytes: number }
+  | { type: 'cache-skip'; url: string; reason: 'no-store' | 'private' }
+  | { type: 'error'; url: string; phase: 'fetch' | 'stream'; error: Error };
 
 export type ProxyCache = {
   // properties
@@ -47,7 +67,10 @@ export type ProxyCache = {
   encodeProxyPath: (url: string) => string;
 };
 
-type WarmCacheOptions = {
+export type WarmCacheOptions = {
+  /** Override the instance's cache-warming concurrency. */
+  concurrency?: number;
+
   /** If true, re-fetch cache seeds and recursively-referenced items,
    * regardless of whether they're already cached and expiration status. */
   force?: boolean;
@@ -56,6 +79,9 @@ type WarmCacheOptions = {
    * than starting from the cache seeds. This flag only makes sense if
    * `force` is also true. */
   reload?: boolean;
+
+  /** Cancel cache warming and all in-flight origin requests. */
+  signal?: AbortSignal;
 };
 
 export type CacheWarmStats = {
@@ -113,6 +139,9 @@ export interface RequestI {
   headers: IncomingHttpHeaders;
   path: string;
   query: Record<string, unknown>;
+  signal?: AbortSignal;
+  once?(event: 'aborted', listener: () => void): unknown;
+  off?(event: 'aborted', listener: () => void): unknown;
 }
 
 /** The express.Response properties that cdnProxyRouter depends on. */
@@ -135,8 +164,16 @@ export function createProxyCache({
   proxyPrefix,
   cachePath,
   cacheSeeds,
+  maxCssTransformBytes = DEFAULT_MAX_CSS_TRANSFORM_BYTES,
+  onEvent,
+  requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   shouldProxyPath,
+  warmConcurrency = DEFAULT_WARM_CONCURRENCY,
 }: ProxyCacheOptions): ProxyCache {
+  requirePositiveInteger('maxCssTransformBytes', maxCssTransformBytes);
+  requirePositiveInteger('requestTimeoutMs', requestTimeoutMs);
+  requirePositiveInteger('warmConcurrency', warmConcurrency);
+
   return {
     cachePath,
     proxyPrefix,
@@ -164,6 +201,7 @@ export function createProxyCache({
       targetResponse.send(`Refusing to proxy URL: ${originUrl}`);
       return;
     }
+    onEvent?.({ type: 'request', url: originUrl });
     // Normalize the encoding and remove 'br', for caching purposes. Safari
     // sends 'gzip, deflate'. Chrome sends 'gzip, deflate, br'. This prevents
     // them from sharing a cache. The simplest solution is to simply not request
@@ -192,79 +230,54 @@ export function createProxyCache({
 
     targetResponse.setHeader('x-cdn-proxy-origin-url', originUrl);
 
-    // Cache hit. This can fall through to the cache miss case if the cached
-    // value is present (in which case this value is send to the original
-    // response) but expired (in which case the request is also sent to the
-    // origin server and, if succesful, asynchronously used to replace the
-    // cached value).
+    let servingStale = false;
     if (cacheObject && !req.query.reload) {
-      debug('cache hit', originUrl);
-      targetResponse.setHeader(HTTP_RESPONSE_HEADER_CACHE_STATUS, 'HIT');
-
-      // Copy the cached headers to the response.
       const { headers } = cacheObject.metadata;
-      for (const key of Object.keys(headers)) {
-        let value = headers[key];
-        switch (key) {
-          case 'location':
-            if (shouldProxyPath(value)) {
-              value = encodeProxyPath(value);
-            }
-            break;
-          case 'cache-control':
-            continue;
+      const policy = parseCacheControl(headers['cache-control']);
+      const age = Math.max(0, Date.now() - cacheObject.time);
+      const lifetime = cacheLifetimeSeconds(policy);
+      const expired = lifetime !== undefined && age >= lifetime * 1000;
+      const cannotReuse = policy.noStore || policy.isPrivate;
+      const requiresRevalidation = cannotReuse || policy.noCache || (expired && policy.mustRevalidate);
+      if (cannotReuse) await cacache.rm.entry(cachePath, cacheKey);
+
+      if (!requiresRevalidation) {
+        servingStale = expired;
+        debug(servingStale ? 'cache stale' : 'cache hit', originUrl);
+        onEvent?.({ type: 'cache-hit', url: originUrl, stale: servingStale });
+        targetResponse.setHeader(HTTP_RESPONSE_HEADER_CACHE_STATUS, 'HIT');
+
+        for (const key of Object.keys(headers)) {
+          let value = headers[key];
+          if (key === 'location' && shouldProxyPath(value)) value = encodeProxyPath(value);
+          const headerMap: Record<string, string> = { server: 'origin-server' };
+          targetResponse.setHeader(headerMap[key] ?? key, value);
         }
-        const headerMap: Record<string, string> = { server: 'origin-server' };
-        targetResponse.setHeader(headerMap[key] ?? key, value);
-      }
-      // Add the Age and Cache-Control headers.
-      {
-        const age = Math.max(0, Date.now() - cacheObject.time);
         targetResponse.setHeader('age', Math.floor(age / 1000));
-      }
-      {
-        let cacheControl = headers['cache-control']?.match(/(?:^|\b)(public|private)\b/)?.[1] ?? 'public';
-        const maxAge = headers['cache-control']?.match(/(?:^|\b)max-age=(\d+)/)?.[1];
-        if (maxAge) {
-          cacheControl += `, max-age=${maxAge}`;
+
+        targetResponse.status(cacheObject.metadata.status);
+        let cachedStream = cacache.get.stream(cachePath, cacheKey) as unknown as NodeJS.ReadableStream;
+        cachedStream = makeProxyReplacementStream(
+          cachedStream,
+          headers['content-type'],
+          headers['content-encoding'],
+          transformCssUrl,
+          maxCssTransformBytes
+        );
+        cachedStream.on('error', (error) => res.destroy(error));
+        cachedStream.pipe(targetResponse);
+
+        if (servingStale) {
+          targetResponse = new NullWritable();
+        } else {
+          await waitForWritable(targetResponse);
+          return;
         }
-        cacheControl += `, stale-while-revalidate=${maxAge || 86400}`;
-        targetResponse.setHeader('cache-control', cacheControl);
-      }
-
-      targetResponse.status(cacheObject.metadata.status);
-      let rstream = cacache.get.stream(cachePath, cacheKey) as unknown as NodeJS.ReadableStream;
-      rstream = makeProxyReplacementStream(
-        rstream,
-        headers['content-type'],
-        headers['content-encoding'],
-        transformCssUrl
-      );
-      rstream.pipe(targetResponse);
-
-      // Check for cache expiration.
-      //
-      // The maxAge value used here differs from the one above, that is used in
-      // the HTTP response header, in that this one prefers the origin server's
-      // s-maxage over max-age if the former exists.
-      const maxAge =
-        (headers['cache-control']?.match(/(?:%|\b)s-maxage=(\d+)/) ||
-          headers['cache-control']?.match(/(?:%|\b)max-age=(\d+)/))?.[1] ?? 'Infinity';
-      const expires = new Date(cacheObject.time + Number(maxAge) * 1000);
-      const expired = expires < new Date();
-      if (expired) {
-        debug('cache expired', originUrl);
-        // The response is complete. Replace the original response instance with one that simply ignores writes.
-        // Using a null Writable reduces the number of code paths, below.
-        targetResponse = new NullWritable();
-      } else {
-        await new Promise((resolve) => targetResponse.on('finish', resolve));
-        return;
       }
     }
 
-    // Cache miss; or expired cache entry
     debug('cache miss', originUrl);
+    onEvent?.({ type: 'cache-miss', url: originUrl });
 
     // filter the headers, and combine string[] values back into strings
     const reqHeaders: Record<string, string> = Object.fromEntries(
@@ -275,77 +288,96 @@ export function createProxyCache({
       ).map(([key, value]) => [key, Array.isArray(value) ? value.join(',') : value])
     );
     if (acceptEncoding) reqHeaders['accept-encoding'] = acceptEncoding;
-    const originResponse = await fetch(originUrl, {
-      compress: false, // don't uncompress gzips — for efficiency, and so that the content matches the content-type
-      headers: reqHeaders,
-      redirect: 'manual', // don't follow redirects; cache the redirect directive instead
-    }).catch((err) => {
-      // This can happen if:
-      // - the URL is invalid
-      // - the origin server is down (unlikely)
-      // - this server is offline from the internet
-      // - this server is behind a firewall (e.g. cdn.jsdelivr.net is blocked in China)
-      console.error(`Error during request for ${originUrl}:\n${err}`);
-      targetResponse.status(500);
-      targetResponse.send(`Error during request for ${originUrl}:\n${err}`);
-      return null;
-    });
-    if (!originResponse) {
-      return;
+    const abortContext = createAbortContext(req, servingStale ? undefined : res, requestTimeoutMs);
+    let responseStarted = false;
+    try {
+      const originResponse = await fetch(originUrl, {
+        compress: false,
+        headers: reqHeaders,
+        redirect: 'manual',
+        signal: abortContext.controller.signal,
+      });
+
+      responseStarted = true;
+      targetResponse.status(originResponse.status);
+      targetResponse.setHeader(HTTP_RESPONSE_HEADER_CACHE_STATUS, 'MISS');
+      const contentType = originResponse.headers.get('content-type') ?? undefined;
+      const contentEncoding = originResponse.headers.get('content-encoding') ?? undefined;
+      originResponse.headers.forEach((value, key) => {
+        if (key === 'content-length' && contentType?.startsWith('text/css')) return;
+        const outputValue = key === 'location' && shouldProxyPath(value) ? encodeProxyPath(value) : value;
+        targetResponse.setHeader(key, outputValue);
+      });
+
+      const redirected =
+        300 < originResponse.status && originResponse.status < 400 && originResponse.headers.has('location');
+      if (!originResponse.ok && !redirected) {
+        debug(`Failed ${originResponse.ok} | ${originResponse.status} | ${originResponse.statusText}`);
+        targetResponse.send(originResponse.statusText);
+        return;
+      }
+
+      const responseHeaders = Object.fromEntries(
+        Array.from(originResponse.headers.entries()).filter(([key]) => !uncacheableResponseHeaders.includes(key))
+      );
+      const cachePolicy = parseCacheControl(responseHeaders['cache-control']);
+      if (!canStoreSharedResponse(cachePolicy)) {
+        const reason = cachePolicy.noStore ? 'no-store' : 'private';
+        onEvent?.({ type: 'cache-skip', url: originUrl, reason });
+        const responseStream = makeProxyReplacementStream(
+          originResponse.body,
+          contentType,
+          contentEncoding,
+          transformCssUrl,
+          maxCssTransformBytes
+        );
+        responseStream.on('error', (error) => targetResponse.destroy(error));
+        responseStream.pipe(targetResponse);
+        await Promise.all([waitForReadable(responseStream), waitForWritable(targetResponse)]);
+        return;
+      }
+
+      const cacheWriteStream = cacache.put.stream(cachePath, cacheKey, {
+        metadata: { originUrl, headers: responseHeaders, status: originResponse.status },
+      }) as unknown as NodeJS.WritableStream;
+      const cacheCommitted = waitForCacheCommit(cacheWriteStream);
+      const streamLengthCounter = new WritableCounter();
+      const responseInput = new stream.PassThrough();
+      const originSink = multiplexStreamWriter([cacheWriteStream, streamLengthCounter, responseInput]);
+      const responseStream = makeProxyReplacementStream(
+        responseInput,
+        contentType,
+        contentEncoding,
+        transformCssUrl,
+        maxCssTransformBytes
+      );
+      responseStream.on('error', (error) => targetResponse.destroy(error));
+      originResponse.body.pipe(originSink);
+      responseStream.pipe(targetResponse);
+      await Promise.all([
+        waitForReadable(responseStream),
+        waitForWritable(originSink),
+        waitForWritable(targetResponse),
+        cacheCommitted,
+      ]);
+      debug('wrote', streamLengthCounter.length, 'bytes to cache for', originUrl);
+      onEvent?.({ type: 'cache-write', url: originUrl, bytes: streamLengthCounter.length });
+    } catch (cause) {
+      if (req.signal?.aborted) throw abortReason(req.signal);
+      const error = toError(cause);
+      onEvent?.({ type: 'error', url: originUrl, phase: responseStarted ? 'stream' : 'fetch', error });
+      debug('origin request failed', originUrl, error);
+      if (servingStale) return;
+      if (responseStarted || abortContext.clientAborted) {
+        targetResponse.destroy(error);
+        return;
+      }
+      const status = abortContext.timedOut ? 504 : 502;
+      targetResponse.status(status);
+      targetResponse.send(`Error during request for ${originUrl}:\n${error.message}`);
+    } finally {
+      abortContext.dispose();
     }
-
-    // Relay the origin status, and add a cache header
-    targetResponse.status(originResponse.status);
-    targetResponse.setHeader(HTTP_RESPONSE_HEADER_CACHE_STATUS, 'MISS');
-
-    // Copy headers from the origin response to the output response.
-    // Modify Location headers to proxy them, in the case of a redirect.
-    originResponse.headers.forEach((value, key) => {
-      const outputValue = key === 'location' && shouldProxyPath(value) ? encodeProxyPath(value) : value;
-      targetResponse.setHeader(key, outputValue);
-    });
-
-    // This test excludes 300 Multiple Choice, since that status code is rarely
-    // used in practice, and would require rewriting the links in the HTML
-    // response.
-    const redirected =
-      300 < originResponse.status && originResponse.status < 400 && originResponse.headers.has('location');
-    if (!originResponse.ok && !redirected) {
-      // don't cache responses other than 200's and redirects
-      debug(`Failed ${originResponse.ok} | ${originResponse.status} | ${originResponse.statusText}`);
-      targetResponse.send(originResponse.statusText);
-      return;
-    }
-
-    // expressjs.Response.headers serializes to {}. Copy it to an Object that can
-    // be serialized to JSON.
-    const responseHeaders = Object.fromEntries(
-      Array.from(originResponse.headers.entries()).filter(([key]) => !uncacheableResponseHeaders.includes(key))
-    );
-    const cacheWriteStream = cacache.put.stream(cachePath, cacheKey, {
-      metadata: {
-        originUrl,
-        headers: responseHeaders,
-        status: originResponse.status,
-      },
-    }) as unknown as NodeJS.WritableStream;
-
-    // pipe the origin response body to both the client response and the cache
-    // write stream. Collect the length of the response for logging.
-    const streamLengthCounter = new WritableCounter();
-    const responseInput = new stream.PassThrough();
-    const originSink = multiplexStreamWriter([cacheWriteStream, streamLengthCounter, responseInput]);
-    const responseStream = makeProxyReplacementStream(
-      responseInput,
-      responseHeaders['content-type'],
-      responseHeaders['content-encoding'],
-      transformCssUrl
-    );
-    responseStream.on('error', (error) => targetResponse.destroy(error));
-    originResponse.body.pipe(originSink);
-    responseStream.pipe(targetResponse);
-    await Promise.all([waitForReadable(responseStream), waitForWritable(originSink), waitForWritable(targetResponse)]);
-    debug('wrote', streamLengthCounter.length, 'bytes to cache for', originUrl);
   }
 
   //#region proxy paths
@@ -408,7 +440,7 @@ export function createProxyCache({
    */
   async function prefetch(
     url: string,
-    { accept = '*/*', force = false },
+    { accept = '*/*', force = false, signal }: { accept?: string; force?: boolean; signal?: AbortSignal },
     redirectChain: readonly string[] = []
   ): Promise<{ status: number; ok: boolean; headers: Record<string, string>; data: Buffer }> {
     if (redirectChain.includes(url) || redirectChain.length >= MAX_REDIRECTS) {
@@ -425,6 +457,7 @@ export function createProxyCache({
       headers: reqHeaders,
       path: encodeProxyPath(url, { includePrefix: false }),
       query: force ? { reload: 'true' } : {},
+      signal,
     };
 
     const res = new (class extends stream.Writable {
@@ -455,7 +488,7 @@ export function createProxyCache({
     if (redirected) {
       const location = decodeProxyPath(res.headers.location);
       debug(`following redirect from ${url} -> ${location}`);
-      return prefetch(location, { accept, force }, [...redirectChain, url]);
+      return prefetch(location, { accept, force, signal }, [...redirectChain, url]);
     }
     return {
       data: Buffer.concat(res.chunks),
@@ -475,12 +508,11 @@ export function createProxyCache({
    * (Currently, only references in CSS files are prefetched.)
    */
   async function warmCache(
-    { force, reload }: { force?: boolean; reload?: boolean },
+    { concurrency = warmConcurrency, force, reload, signal }: WarmCacheOptions,
     callback?: (message: CacheWarmMessage) => void
   ): Promise<CacheWarmStats> {
-    // Most of this function's complexity is due to requesting the URLs
-    // concurrently.
-    const concurrency = 20; // max number of requests to make at once
+    requirePositiveInteger('concurrency', concurrency);
+    if (signal?.aborted) throw abortReason(signal);
     const stats = { total: 0, failures: 0, hits: 0, misses: 0 };
     const urls = removeArrayDuplicates(reload ? await getCachedUrls() : cacheSeeds).sort();
     callback?.({ type: 'initial', total: urls.length });
@@ -488,19 +520,22 @@ export function createProxyCache({
     const seen = new Set<string>();
     const promises: Promise<void>[] = [];
     // `while` instead of `for`, because visit() can add to the array.
-    while (urls.length > 0 || promises.length > 0) {
-      const url = urls.shift();
-      if (url) {
-        if (seen.has(url)) continue;
-        seen.add(url);
-        callback?.({ type: 'prefetch', url });
-        await visit(url);
-      } else {
-        // One of the pending promises could add more urls to the queue, so wait
-        // for the next one inside the loop, instead of awaiting Promise.all()
-        // at the end.
-        await Promise.race(promises);
+    try {
+      while (urls.length > 0 || promises.length > 0) {
+        if (signal?.aborted) throw abortReason(signal);
+        const url = urls.shift();
+        if (url) {
+          if (seen.has(url)) continue;
+          seen.add(url);
+          callback?.({ type: 'prefetch', url });
+          await visit(url);
+        } else {
+          await Promise.race(promises);
+        }
       }
+    } catch (error) {
+      await Promise.allSettled(promises);
+      throw error;
     }
 
     return stats;
@@ -519,7 +554,7 @@ export function createProxyCache({
           '.css': 'text/css,*/*;q=0.1',
           '.html': 'text/html',
         }[path.extname(url)] || '*/*';
-      const p = prefetch(url, { accept, force })
+      const p = prefetch(url, { accept, force, signal })
         .then(({ status, ok, headers, data }) => {
           if (ok) {
             const hit = headers[HTTP_RESPONSE_HEADER_CACHE_STATUS] === 'HIT';
@@ -528,7 +563,7 @@ export function createProxyCache({
             // add this document's URLs to the list of URLs to prefetch
             if (headers['content-type']?.startsWith('text/css') && data.length > 0) {
               const encoding = headers['content-encoding'];
-              const decoded = decodeContent(data, encoding);
+              const decoded = decodeContent(data, encoding, maxCssTransformBytes);
               if (decoded) {
                 data = decoded;
               } else {
@@ -552,7 +587,7 @@ export function createProxyCache({
                 return undefined;
               });
             }
-            callback?.({ type: 'progress', stats });
+            callback?.({ type: 'progress', stats: { ...stats } });
           } else {
             stats.failures++;
             callback?.({ type: 'error', url, status });
@@ -628,6 +663,62 @@ function waitForWritable(writable: NodeJS.WritableStream): Promise<void> {
     writable.once('finish', resolve);
     writable.once('error', reject);
   });
+}
+
+function waitForCacheCommit(writable: NodeJS.WritableStream): Promise<void> {
+  return new Promise((resolve, reject) => {
+    writable.once('integrity', resolve);
+    writable.once('error', reject);
+  });
+}
+
+function createAbortContext(req: RequestI, res: ResponseI | undefined, timeoutMs: number) {
+  const controller = new AbortController();
+  let clientAborted = false;
+  let timedOut = false;
+  const abortFromSignal = () => controller.abort(abortReason(req.signal!));
+  const abortFromClient = () => {
+    clientAborted = true;
+    controller.abort(new Error('Client disconnected'));
+  };
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new Error(`Origin request timed out after ${timeoutMs}ms`));
+  }, timeoutMs);
+  req.signal?.addEventListener('abort', abortFromSignal, { once: true });
+  req.once?.('aborted', abortFromClient);
+  res?.once('close', abortFromClient);
+  if (req.signal?.aborted) abortFromSignal();
+
+  return {
+    controller,
+    get clientAborted() {
+      return clientAborted;
+    },
+    get timedOut() {
+      return timedOut;
+    },
+    dispose() {
+      clearTimeout(timeout);
+      req.signal?.removeEventListener('abort', abortFromSignal);
+      req.off?.('aborted', abortFromClient);
+      res?.off('close', abortFromClient);
+    },
+  };
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error('Operation aborted');
+}
+
+function toError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
+}
+
+function requirePositiveInteger(name: string, value: number): void {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new RangeError(`${name} must be a positive integer`);
+  }
 }
 
 function removeArrayDuplicates<T>(array: T[]): T[] {

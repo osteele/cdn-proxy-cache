@@ -9,7 +9,7 @@ import zlib from 'node:zlib';
 import { warmCache as runWarmCache, showCacheInfo } from '../src/commands';
 import { fromReadable } from '../src/helpers/stream-helpers';
 import { decodeContent, makeProxyReplacementStream } from '../src/internal/content';
-import { createProxyCache } from '../src/proxyCache';
+import { createProxyCache, type ProxyCacheEvent, type ProxyCacheOptions } from '../src/proxyCache';
 
 function isCdnUrl(url: string): boolean {
   if (!/^https?:/.test(url)) return false;
@@ -171,6 +171,17 @@ describe('CDN Proxy', () => {
       );
       await expect(fromReadable(outputStream)).rejects.toThrow();
     });
+
+    test('rejects stylesheets above the transformation limit', async () => {
+      const outputStream = makeProxyReplacementStream(
+        stream.Readable.from('body { color: red; }'),
+        'text/css',
+        undefined,
+        () => undefined,
+        8
+      );
+      await expect(fromReadable(outputStream)).rejects.toThrow('8-byte transformation limit');
+    });
   });
 
   describe('cache warming integration', () => {
@@ -203,6 +214,28 @@ describe('CDN Proxy', () => {
       }
     });
 
+    test('serves fresh responses from cache', async () => {
+      let requests = 0;
+      const server = http.createServer((_req, res) => {
+        requests++;
+        res.setHeader('cache-control', 'max-age=60');
+        res.end('asset');
+      });
+      const origin = await listen(server);
+      const events: ProxyCacheEvent[] = [];
+      const cache = createLocalCache(origin, [`${origin}/asset`], { onEvent: (event) => events.push(event) });
+
+      try {
+        await cache.warm({});
+        await cache.warm({});
+        expect(requests).toBe(1);
+        expect(events.some((event) => event.type === 'cache-hit' && !event.stale)).toBe(true);
+      } finally {
+        await cache.clear();
+        await close(server);
+      }
+    });
+
     test('stops redirect cycles', async () => {
       let origin = '';
       let requests = 0;
@@ -224,15 +257,120 @@ describe('CDN Proxy', () => {
         await close(server);
       }
     });
+
+    for (const { directive, name, shouldStore } of [
+      { directive: 'no-store', name: 'does not store no-store responses', shouldStore: false },
+      { directive: 'no-cache', name: 'revalidates no-cache responses', shouldStore: true },
+      {
+        directive: 'max-age=0, must-revalidate',
+        name: 'revalidates expired must-revalidate responses',
+        shouldStore: true,
+      },
+    ]) {
+      test(name, async () => {
+        let requests = 0;
+        const server = http.createServer((_req, res) => {
+          requests++;
+          res.setHeader('cache-control', directive);
+          res.end(`response ${requests}`);
+        });
+        const origin = await listen(server);
+        const cache = createLocalCache(origin, [`${origin}/asset`]);
+
+        try {
+          await cache.warm({});
+          await cache.warm({});
+          expect(requests).toBe(2);
+          expect(Object.keys(await cache.ls()).length).toBe(shouldStore ? 1 : 0);
+        } finally {
+          await cache.clear();
+          await close(server);
+        }
+      });
+    }
+
+    test('bounds cache-warming concurrency', async () => {
+      let active = 0;
+      let maximumActive = 0;
+      const server = http.createServer((_req, res) => {
+        active++;
+        maximumActive = Math.max(maximumActive, active);
+        setTimeout(() => {
+          active--;
+          res.end('asset');
+        }, 30);
+      });
+      const origin = await listen(server);
+      const seeds = Array.from({ length: 5 }, (_, index) => `${origin}/asset-${index}`);
+      const cache = createLocalCache(origin, seeds);
+
+      try {
+        await cache.warm({ concurrency: 2 });
+        expect(maximumActive).toBe(2);
+      } finally {
+        await cache.clear();
+        await close(server);
+      }
+    });
+
+    test('times out stalled origin requests', async () => {
+      const server = http.createServer(() => {});
+      const origin = await listen(server);
+      const events: ProxyCacheEvent[] = [];
+      const cache = createLocalCache(origin, [`${origin}/slow`], {
+        onEvent: (event) => events.push(event),
+        requestTimeoutMs: 25,
+      });
+
+      try {
+        const stats = await cache.warm({});
+        expect(stats.failures).toBe(1);
+        expect(events.some((event) => event.type === 'error' && event.phase === 'fetch')).toBe(true);
+      } finally {
+        await cache.clear();
+        await close(server);
+      }
+    });
+
+    test('cancels in-flight cache warming', async () => {
+      const server = http.createServer((_req, res) => setTimeout(() => res.end('late'), 200));
+      const origin = await listen(server);
+      const cache = createLocalCache(origin, [`${origin}/slow`]);
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new Error('stop warming')), 20);
+
+      try {
+        await expect(cache.warm({ signal: controller.signal })).rejects.toThrow('stop warming');
+      } finally {
+        await cache.clear();
+        await close(server);
+      }
+    });
+
+    test('emits structured cache lifecycle events', async () => {
+      const server = http.createServer((_req, res) => res.end('asset'));
+      const origin = await listen(server);
+      const events: ProxyCacheEvent[] = [];
+      const cache = createLocalCache(origin, [`${origin}/asset`], { onEvent: (event) => events.push(event) });
+
+      try {
+        await cache.warm({});
+        expect(events.map((event) => event.type)).toEqual(['request', 'cache-miss', 'cache-write']);
+      } finally {
+        await cache.clear();
+        await close(server);
+      }
+    });
   });
 });
 
-function createLocalCache(origin: string, cacheSeeds: string[]) {
+function createLocalCache(origin: string, cacheSeeds: string[], options: Partial<ProxyCacheOptions> = {}) {
   return createProxyCache({
     proxyPrefix: '/__proxy_cache',
     cachePath: path.join(os.tmpdir(), `cdn-proxy-cache-test-${randomUUID()}`),
     cacheSeeds,
     shouldProxyPath: (url) => url.startsWith(`${origin}/`),
+    ...options,
   });
 }
 

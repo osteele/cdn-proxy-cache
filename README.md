@@ -22,7 +22,7 @@ A caching proxy for CDN resources with URL rewriting, content transformation, an
 ## Installation
 
 ```bash
-bun add cdn-proxy-cache
+bun add cdn-proxy-cache express
 ```
 
 ## Quick Start
@@ -47,6 +47,10 @@ const cache = createProxyCache({
     'https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js',
   ],
   shouldProxyPath: (url) => /^https?:/.test(url) && cdnHosts.has(new URL(url).hostname),
+  requestTimeoutMs: 30_000,
+  maxCssTransformBytes: 5 * 1024 * 1024,
+  warmConcurrency: 20,
+  onEvent: (event) => console.debug(event),
 });
 
 // Mount the proxy router
@@ -98,6 +102,13 @@ Creates a new proxy cache instance.
 - `shouldProxyPath` (function): Callback to determine if a URL should be proxied
   - Signature: `(url: string) => boolean`
   - Return `true` to proxy the URL, `false` to pass through
+- `requestTimeoutMs` (number, default `30000`): Origin-request timeout, including response streaming
+- `maxCssTransformBytes` (number, default `5242880`): Maximum decompressed CSS size buffered for rewriting
+- `warmConcurrency` (number, default `20`): Default cache-warming concurrency
+- `onEvent` (function): Receives structured request, hit, miss, write, skip, and error events
+
+Responses marked `no-store` or `private` are not stored. Responses marked `no-cache`, and expired responses marked
+`must-revalidate`, are fetched from the origin before they are served.
 
 **Returns:** `ProxyCache` instance with the following methods:
 
@@ -124,6 +135,8 @@ Pre-fetches resources into the cache.
 **Options:**
 - `force` (boolean): Re-fetch even if already cached
 - `reload` (boolean): Re-fetch all currently cached items (requires `force: true`)
+- `concurrency` (number): Override the instance's cache-warming concurrency
+- `signal` (AbortSignal): Cancel warming and its in-flight origin requests
 
 **Callback:** Receives progress messages:
 - `{ type: 'initial', total: number }` - Cache warming started
