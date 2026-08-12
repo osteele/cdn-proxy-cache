@@ -11,6 +11,8 @@
 - Stores responses in a content-addressable cache managed by `cacache`.
 - Rewrites matching `<script src>`, stylesheet `<link href>`, and CSS `url()` values.
 - Preserves gzip and deflate encoding while rewriting CSS.
+- Coalesces simultaneous misses and stale refreshes for the same cache key.
+- Revalidates cached responses with ETag and Last-Modified validators.
 - Serves ordinary expired entries while refreshing them in the background.
 - Honors `no-store`, `private`, `no-cache`, and `must-revalidate` cache directives.
 - Warms the cache from seed URLs and follows references found in CSS.
@@ -226,9 +228,9 @@ The package does not install a command-line executable.
 
 ## Request flow
 
-Each request uses a cache key built from the origin URL, `Accept`, and a normalized `Accept-Encoding` value. The proxy removes Brotli from `Accept-Encoding` so browsers can share gzip or deflate entries.
+Each request uses a cache key built from the origin URL and canonicalized `Accept` and `Accept-Encoding` values. The proxy removes Brotli from `Accept-Encoding` so browsers can share gzip or deflate entries without creating duplicates for equivalent header orderings.
 
-On a miss, the origin body is sent to the client and `cacache` at the same time. CSS takes a separate transformation path because `css-tree` needs the complete decompressed stylesheet. Other response bodies remain streaming.
+On a miss, ordinary origin bodies are sent to the client and `cacache` at the same time. CSS takes a separate transformation path because `css-tree` needs the complete decompressed stylesheet; the rewritten result is cached so subsequent hits do not repeat parsing and compression. Other response bodies remain streaming.
 
 ## Development
 

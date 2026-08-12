@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import stream from 'node:stream';
 import zlib from 'node:zlib';
+import * as cacache from 'cacache';
 import { warmCache as runWarmCache, showCacheInfo } from '../src/commands';
 import { fromReadable } from '../src/helpers/stream-helpers';
 import { decodeContent, makeProxyReplacementStream } from '../src/internal/content';
@@ -236,6 +237,130 @@ describe('CDN Proxy', () => {
       }
     });
 
+    test('coalesces concurrent cache misses', async () => {
+      let requests = 0;
+      const server = http.createServer((_req, res) => {
+        requests++;
+        res.setHeader('cache-control', 'max-age=60');
+        setTimeout(() => res.end('asset'), 25);
+      });
+      const origin = await listen(server);
+      const cache = createLocalCache(origin, []);
+
+      try {
+        const responses = await Promise.all(Array.from({ length: 8 }, () => requestCache(cache, `${origin}/asset`)));
+        expect(requests).toBe(1);
+        expect(responses.map((response) => response.body)).toEqual(Array(8).fill('asset'));
+      } finally {
+        await cache.clear();
+        await close(server);
+      }
+    });
+
+    test('coalesces concurrent stale refreshes', async () => {
+      let requests = 0;
+      const server = http.createServer((_req, res) => {
+        requests++;
+        res.setHeader('cache-control', 'max-age=0');
+        res.end(Buffer.alloc(64 * 1024, 'x'));
+      });
+      const origin = await listen(server);
+      const cache = createLocalCache(origin, []);
+
+      try {
+        await requestCache(cache, `${origin}/asset`);
+        await Promise.all(Array.from({ length: 8 }, () => requestCache(cache, `${origin}/asset`)));
+        expect(requests).toBe(2);
+      } finally {
+        await cache.clear();
+        await close(server);
+      }
+    });
+
+    test('revalidates cached responses with origin validators', async () => {
+      let requests = 0;
+      let conditionalRequests = 0;
+      const server = http.createServer((req, res) => {
+        requests++;
+        res.setHeader('cache-control', 'no-cache');
+        res.setHeader('etag', '"asset-v1"');
+        if (req.headers['if-none-match'] === '"asset-v1"') {
+          conditionalRequests++;
+          res.statusCode = 304;
+          res.end();
+        } else {
+          res.end('asset');
+        }
+      });
+      const origin = await listen(server);
+      const cache = createLocalCache(origin, []);
+
+      try {
+        const first = await requestCache(cache, `${origin}/asset`);
+        const second = await requestCache(cache, `${origin}/asset`);
+        expect(requests).toBe(2);
+        expect(conditionalRequests).toBe(1);
+        expect(first.body).toBe('asset');
+        expect(second.body).toBe('asset');
+        expect(second.statusCode).toBe(200);
+      } finally {
+        await cache.clear();
+        await close(server);
+      }
+    });
+
+    test('canonicalizes equivalent accept-encoding values', async () => {
+      let requests = 0;
+      const server = http.createServer((_req, res) => {
+        requests++;
+        res.setHeader('cache-control', 'max-age=60');
+        res.end('asset');
+      });
+      const origin = await listen(server);
+      const cache = createLocalCache(origin, []);
+
+      try {
+        await requestCache(cache, `${origin}/asset`, { 'accept-encoding': 'gzip, deflate, br' });
+        await requestCache(cache, `${origin}/asset`, { 'accept-encoding': 'deflate, gzip' });
+        expect(requests).toBe(1);
+        expect(Object.keys(await cache.ls())).toHaveLength(1);
+      } finally {
+        await cache.clear();
+        await close(server);
+      }
+    });
+
+    test('stores rewritten CSS so cache hits do not repeat the transformation', async () => {
+      let assetChecks = 0;
+      const server = http.createServer((_req, res) => {
+        res.setHeader('cache-control', 'max-age=60');
+        res.setHeader('content-type', 'text/css');
+        res.end(`body { background: url("${origin}/asset.png"); }`);
+      });
+      const origin = await listen(server);
+      const cache = createLocalCache(origin, [], {
+        shouldProxyPath: (url) => {
+          if (url === `${origin}/asset.png`) assetChecks++;
+          return url.startsWith(`${origin}/`);
+        },
+      });
+
+      try {
+        await requestCache(cache, `${origin}/style.css`);
+        expect(assetChecks).toBe(1);
+        await requestCache(cache, `${origin}/style.css`);
+        expect(assetChecks).toBe(1);
+        const entries = Object.values(await cache.ls());
+        expect(entries).toHaveLength(1);
+        expect(entries[0].metadata.cssTransformed).toBe(true);
+        const stored = await cacache.get.byDigest(cache.cachePath, entries[0].integrity);
+        expect(stored.toString()).toContain('/__proxy_cache/http/127.0.0.1');
+      } finally {
+        await cache.clear();
+        await close(server);
+      }
+    });
+
     test('stops redirect cycles', async () => {
       let origin = '';
       let requests = 0;
@@ -372,6 +497,40 @@ function createLocalCache(origin: string, cacheSeeds: string[], options: Partial
     shouldProxyPath: (url) => url.startsWith(`${origin}/`),
     ...options,
   });
+}
+
+async function requestCache(
+  cache: ReturnType<typeof createProxyCache>,
+  url: string,
+  headers: http.IncomingHttpHeaders = {}
+): Promise<{ body: string; headers: Record<string, string>; statusCode: number }> {
+  const response = new (class extends stream.Writable {
+    chunks: Buffer[] = [];
+    headers: Record<string, string> = {};
+    statusCode = 200;
+
+    setHeader(key: string, value: string | number | readonly string[]) {
+      this.headers[key.toLowerCase()] = Array.isArray(value) ? value.join(', ') : String(value);
+    }
+    send(chunk: string | Buffer) {
+      this.chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+      this.end();
+    }
+    status(code: number) {
+      this.statusCode = code;
+    }
+    _write(chunk: Buffer, _encoding: BufferEncoding, callback: () => void) {
+      this.chunks.push(chunk);
+      callback();
+    }
+  })();
+
+  await cache.router({ headers, path: cache.encodeProxyPath(url), query: {} }, response);
+  return {
+    body: Buffer.concat(response.chunks).toString(),
+    headers: response.headers,
+    statusCode: response.statusCode,
+  };
 }
 
 async function listen(server: http.Server): Promise<string> {

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Canonicalized `Accept` and `Accept-Encoding` cache-key values so equivalent requests share entries.
+- Cached rewritten CSS and reused cached content by digest, avoiding repeated index lookups, CSS parsing, and recompression.
+- Reworked cache warming to avoid retaining non-CSS bodies and to deduplicate its dynamic URL queue in constant time.
+
+### Fixed
+
+- Coalesced simultaneous misses and stale refreshes for the same cache key.
+- Revalidated cached responses with `ETag` and `Last-Modified` validators and reused cached bodies after `304 Not Modified` responses.
+- Restored backpressure progress for background stale refreshes, which could previously stall until the origin timeout.
+
+### Performance
+
+- In a local loopback benchmark with Bun 1.3.14 on arm64 macOS and 512 KiB responses, 12 simultaneous cold requests dropped from 12 origin transfers (6 MiB) to one (512 KiB), a 91.7% body-bandwidth reduction. Two conditional accesses dropped from 1 MiB to 512 KiB, and two equivalent encoding variants dropped from 1 MiB to 512 KiB. Across those three scenarios, origin body transfer fell from 8 MiB to 1.5 MiB (81.25%).
+- Five cached 512 KiB CSS responses fell from 101.4 ms to 3.6 ms in the same benchmark after caching the transformed representation, a 96.4% reduction. A 12-request stale-refresh burst completed in 29.4 ms instead of exceeding the benchmark's 10-second watchdog.
+- Warming 20 concurrent 512 KiB non-CSS assets no longer retains up to 10 MiB of complete response bodies for dependency inspection; those bodies remain streaming.
+
 ## [0.2.0] - 2026-08-11
 
 This is the first public release.

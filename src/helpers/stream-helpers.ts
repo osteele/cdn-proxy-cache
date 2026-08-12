@@ -1,20 +1,6 @@
 import assert from 'node:assert';
 import stream from 'node:stream';
 
-/** A stream.Writable that counts the number of characters, buffer items,
- * Uint8Array items, or objects written to it. */
-export class WritableCounter extends stream.Writable {
-  length = 0;
-  _write(chunk: unknown, _encoding: BufferEncoding, callback: () => void) {
-    if (typeof chunk === 'string' || chunk instanceof Buffer || chunk instanceof Uint8Array) {
-      this.length += chunk.length;
-    } else {
-      this.length++;
-    }
-    callback();
-  }
-}
-
 /** Read the remaining chunks from a ReadableStream, and combine them into a
  * single string (if they are all strings) or Buffer.
  *
@@ -40,7 +26,9 @@ export async function fromReadable(
           : Buffer.concat(chunks.map((chunk) => (typeof chunk === 'string' ? Buffer.from(chunk) : chunk)));
 }
 
-export function multiplexStreamWriter(streams: NodeJS.WritableStream[]): NodeJS.WritableStream {
+type DestroyableWritable = NodeJS.WritableStream & { destroy(error?: Error): void };
+
+export function multiplexStreamWriter(streams: DestroyableWritable[]): stream.Writable {
   assert.notEqual(streams.length, 0);
   const writer = new stream.PassThrough({
     write(chunk, encoding, callback) {
@@ -64,6 +52,10 @@ export function multiplexStreamWriter(streams: NodeJS.WritableStream[]): NodeJS.
           }
         });
       }
+    },
+    destroy(error, callback) {
+      for (const destination of streams) destination.destroy(error ?? undefined);
+      callback(error);
     },
   });
   for (const destination of streams) {

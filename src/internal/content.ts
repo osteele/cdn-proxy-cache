@@ -104,7 +104,7 @@ async function readWithLimit(input: NodeJS.ReadableStream, limit: number): Promi
     if (length > limit) throw new ContentTooLargeError(limit);
     chunks.push(buffer);
   }
-  return Buffer.concat(chunks);
+  return Buffer.concat(chunks, length);
 }
 
 /** Call `callback` for each URL in the CSS stylesheet. If `callback` returns a
