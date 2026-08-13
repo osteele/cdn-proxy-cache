@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Coalesced simultaneous misses and stale refreshes for the same cache key.
 - Revalidated cached responses with `ETag` and `Last-Modified` validators and reused cached bodies after `304 Not Modified` responses.
 - Restored backpressure progress for background stale refreshes, which could previously stall until the origin timeout.
+- Preserved percent-encoded origin query strings without double decoding.
+- Resolved and followed relative redirect locations through the proxy.
+- Reported body-stream and CSS transformation failures during cache warming.
+- Partitioned shared entries by `Accept-Language`, rejected `Vary: *`, and stopped forwarding browser user agents.
+- Invalidated transformed CSS when its proxy transformation configuration changes.
+- Included the origin's `Age` value in freshness and revalidation decisions.
 
 ### Performance
 

@@ -113,6 +113,7 @@ Creates a `ProxyCache` instance.
 | `cachePath` | `string` | required | Directory used for cached content and metadata. |
 | `cacheSeeds` | `string[]` | required | Starting URLs for `cache.warm()`. Use an empty array when warming is not needed. |
 | `shouldProxyPath` | `(url: string) => boolean` | required | Return `true` for URLs that the cache may rewrite and proxy. |
+| `cssTransformVersion` | `string` | `''` | Bump when configuration captured by `shouldProxyPath` changes without changing the callback source. |
 | `requestTimeoutMs` | `number` | `30000` | Maximum origin-request time, including response streaming. |
 | `maxCssTransformBytes` | `number` | `5242880` | Maximum decompressed CSS size buffered for rewriting. |
 | `warmConcurrency` | `number` | `20` | Default maximum number of simultaneous warming requests. |
@@ -133,7 +134,7 @@ Responses include these diagnostic headers:
 - `x-cdn-proxy-cache-hit`: `HIT` or `MISS`.
 - `x-cdn-proxy-origin-url`: decoded origin URL.
 
-The cache does not store responses marked `no-store` or `private`. It fetches `no-cache` responses before serving them. Expired responses marked `must-revalidate` are also fetched before they are served. Other expired responses are served immediately and refreshed in the background.
+The cache does not store responses marked `no-store` or `private`, or responses with `Vary: *`. It fetches `no-cache` responses before serving them. Expired responses marked `must-revalidate` are also fetched before they are served. Other expired responses are served immediately and refreshed in the background.
 
 ### `cache.replaceUrlsInHtml(html)`
 
@@ -197,7 +198,7 @@ type ProxyCacheEvent =
   | { type: 'cache-hit'; url: string; stale: boolean }
   | { type: 'cache-miss'; url: string }
   | { type: 'cache-write'; url: string; bytes: number }
-  | { type: 'cache-skip'; url: string; reason: 'no-store' | 'private' }
+  | { type: 'cache-skip'; url: string; reason: 'no-store' | 'private' | 'vary-star' }
   | { type: 'error'; url: string; phase: 'fetch' | 'stream'; error: Error };
 ```
 
@@ -228,9 +229,9 @@ The package does not install a command-line executable.
 
 ## Request flow
 
-Each request uses a cache key built from the origin URL and canonicalized `Accept` and `Accept-Encoding` values. The proxy removes Brotli from `Accept-Encoding` so browsers can share gzip or deflate entries without creating duplicates for equivalent header orderings.
+Each request uses a cache key built from the origin URL and canonicalized `Accept`, `Accept-Language`, and `Accept-Encoding` values. These are all the representation-selecting request headers forwarded to the origin; the browser's `User-Agent` is not forwarded. The proxy removes Brotli from `Accept-Encoding` so browsers can share gzip or deflate entries without creating duplicates for equivalent header orderings.
 
-On a miss, ordinary origin bodies are sent to the client and `cacache` at the same time. CSS takes a separate transformation path because `css-tree` needs the complete decompressed stylesheet; the rewritten result is cached so subsequent hits do not repeat parsing and compression. Other response bodies remain streaming.
+On a miss, ordinary origin bodies are sent to the client and `cacache` at the same time. CSS takes a separate transformation path because `css-tree` needs the complete decompressed stylesheet; the rewritten result is cached so subsequent hits do not repeat parsing and compression. The cache records a fingerprint of the transformation configuration and refetches transformed CSS when that fingerprint changes. Set `cssTransformVersion` when `shouldProxyPath` depends on closed-over configuration that may change between cache instances. Other response bodies remain streaming.
 
 ## Development
 

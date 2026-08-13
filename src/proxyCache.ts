@@ -27,6 +27,8 @@ const TRANSFORMED_CSS_ENCODINGS = new Set([undefined, 'deflate', 'gzip', 'x-gzip
 export type ProxyCacheOptions = {
   cachePath: string;
   cacheSeeds: string[];
+  /** Bump this value when closed-over shouldProxyPath configuration changes. */
+  cssTransformVersion?: string;
   /** Maximum decompressed CSS size that may be buffered for rewriting. */
   maxCssTransformBytes?: number;
   /** Receives structured cache lifecycle events. */
@@ -44,7 +46,7 @@ export type ProxyCacheEvent =
   | { type: 'cache-hit'; url: string; stale: boolean }
   | { type: 'cache-miss'; url: string }
   | { type: 'cache-write'; url: string; bytes: number }
-  | { type: 'cache-skip'; url: string; reason: 'no-store' | 'private' }
+  | { type: 'cache-skip'; url: string; reason: 'no-store' | 'private' | 'vary-star' }
   | { type: 'error'; url: string; phase: 'fetch' | 'stream'; error: Error };
 
 export type ProxyCache = {
@@ -125,7 +127,7 @@ const uncacheableResponseHeaders = [
 // Request headers that are passed through to the proxied request. Other headers
 // are ignored, in order to assure that the cached response can be shared
 // between different requests.
-const headerAcceptList = ['accept', 'accept-language', 'accept-encoding', 'user-agent'];
+const headerAcceptList = ['accept', 'accept-language', 'accept-encoding'];
 
 // A dummy function used with typeof to derive the type of the bound method.
 const cacacheLsBind = () => cacache.ls('cachePath');
@@ -156,7 +158,11 @@ export interface ResponseI extends NodeJS.WritableStream {
 type CacheMetadata = {
   /** Absent on cache entries written before transformed CSS was stored. */
   cssTransformed?: boolean;
+  /** Identifies the configuration used to rewrite a stored CSS representation. */
+  cssTransformFingerprint?: string;
   headers: Record<string, string>;
+  /** Age reported by the origin when this representation was stored or revalidated. */
+  initialAgeSeconds?: number;
   originUrl: string;
   status: number;
 };
@@ -175,6 +181,7 @@ export function createProxyCache({
   proxyPrefix,
   cachePath,
   cacheSeeds,
+  cssTransformVersion = '',
   maxCssTransformBytes = DEFAULT_MAX_CSS_TRANSFORM_BYTES,
   onEvent,
   requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
@@ -185,6 +192,12 @@ export function createProxyCache({
   requirePositiveInteger('requestTimeoutMs', requestTimeoutMs);
   requirePositiveInteger('warmConcurrency', warmConcurrency);
   const inFlightRequests = new Map<string, Promise<void>>();
+  const cssTransformFingerprint = JSON.stringify({
+    schema: 1,
+    proxyPrefix,
+    shouldProxyPath: shouldProxyPath.toString(),
+    version: cssTransformVersion,
+  });
 
   return {
     cachePath,
@@ -215,19 +228,17 @@ export function createProxyCache({
     }
     onEvent?.({ type: 'request', url: originUrl });
     const accept = normalizeAccept(req.headers.accept);
+    const acceptLanguage = normalizeAcceptLanguage(req.headers['accept-language']);
     const acceptEncoding = normalizeAcceptEncoding(req.headers['accept-encoding']);
     // An earlier version used a cryptographic digest of the stringified JSON;
     // however, the 'crypto' module is not present in VSCode.
     const cacheKey = JSON.stringify({
       url: originUrl,
-      // Formally, the cache key should include the headers in the Vary response
-      // header. In practice, this header only has at most the following keys;
-      // and, it is harmless to vary on them even when they aren't specified.
-      //
-      // Do NOT cache on User-Agent. It is not necessary for the supported CDNs,
-      // and it would bust the cache between different browsers, which is
-      // undesireable for offline development.
+      // Include every representation-selecting request header that the proxy
+      // forwards. User-Agent is intentionally not forwarded so browser versions
+      // do not fragment the shared cache.
       accept,
+      acceptLanguage,
       acceptEncoding,
     });
     let cacheObject = await cacache.get.info(cachePath, cacheKey);
@@ -238,30 +249,35 @@ export function createProxyCache({
     let staleResponseCompletion: Promise<void> | undefined;
     if (cacheObject && !req.query.reload) {
       const metadata = cacheObject.metadata as CacheMetadata;
-      const { headers } = metadata;
-      const policy = parseCacheControl(headers['cache-control']);
-      const age = Math.max(0, Date.now() - cacheObject.time);
-      const lifetime = cacheLifetimeSeconds(policy);
-      const expired = lifetime !== undefined && age >= lifetime * 1000;
-      const cannotReuse = policy.noStore || policy.isPrivate;
-      const requiresRevalidation = cannotReuse || policy.noCache || (expired && policy.mustRevalidate);
-      if (cannotReuse) {
+      if (metadata.cssTransformed && metadata.cssTransformFingerprint !== cssTransformFingerprint) {
         await cacache.rm.entry(cachePath, cacheKey);
         cacheObject = null;
-      }
+      } else {
+        const { headers } = metadata;
+        const policy = parseCacheControl(headers['cache-control']);
+        const age = Math.max(0, Date.now() - cacheObject.time) + metadataInitialAgeSeconds(metadata) * 1000;
+        const lifetime = cacheLifetimeSeconds(policy);
+        const expired = lifetime !== undefined && age >= lifetime * 1000;
+        const cannotReuse = policy.noStore || policy.isPrivate || variesOnWildcard(headers.vary);
+        const requiresRevalidation = cannotReuse || policy.noCache || (expired && policy.mustRevalidate);
+        if (cannotReuse) {
+          await cacache.rm.entry(cachePath, cacheKey);
+          cacheObject = null;
+        }
 
-      if (cacheObject && !requiresRevalidation) {
-        servingStale = expired;
-        debug(servingStale ? 'cache stale' : 'cache hit', originUrl);
-        onEvent?.({ type: 'cache-hit', url: originUrl, stale: servingStale });
-        const completion = serveCachedEntry(cacheObject, targetResponse, res, age);
+        if (cacheObject && !requiresRevalidation) {
+          servingStale = expired;
+          debug(servingStale ? 'cache stale' : 'cache hit', originUrl);
+          onEvent?.({ type: 'cache-hit', url: originUrl, stale: servingStale });
+          const completion = serveCachedEntry(cacheObject, targetResponse, res, age);
 
-        if (servingStale) {
-          staleResponseCompletion = completion;
-          targetResponse = new NullWritable();
-        } else {
-          await completion;
-          return;
+          if (servingStale) {
+            staleResponseCompletion = completion;
+            targetResponse = new NullWritable();
+          } else {
+            await completion;
+            return;
+          }
         }
       }
     }
@@ -302,6 +318,8 @@ export function createProxyCache({
         if (isDefined(value)) reqHeaders[key] = Array.isArray(value) ? value.join(',') : value;
       }
       reqHeaders.accept = accept;
+      if (acceptLanguage) reqHeaders['accept-language'] = acceptLanguage;
+      else delete reqHeaders['accept-language'];
       if (acceptEncoding) reqHeaders['accept-encoding'] = acceptEncoding;
       else delete reqHeaders['accept-encoding'];
 
@@ -327,19 +345,32 @@ export function createProxyCache({
         const contentType = originResponse.headers.get('content-type') ?? undefined;
         const contentEncoding = originResponse.headers.get('content-encoding') ?? undefined;
         const responseHeaders = Object.fromEntries(
-          Array.from(originResponse.headers.entries()).filter(([key]) => !uncacheableResponseHeaders.includes(key))
+          Array.from(originResponse.headers.entries())
+            .filter(([key]) => !uncacheableResponseHeaders.includes(key))
+            .map(([key, value]) => [key, key === 'location' ? resolveLocation(originUrl, value) : value])
         );
 
         if (originResponse.status === 304 && cacheObject && cachedMetadata) {
           const headers = { ...cachedMetadata.headers, ...responseHeaders };
+          if (!('age' in responseHeaders)) delete headers.age;
+          const refreshedMetadata = {
+            ...cachedMetadata,
+            headers,
+            initialAgeSeconds: parseAgeSeconds(responseHeaders.age),
+          } satisfies CacheMetadata;
           const refreshedEntry = await cacache.index.insert(cachePath, cacheKey, cacheObject.integrity, {
-            metadata: { ...cachedMetadata, headers },
+            metadata: refreshedMetadata,
             size: cacheObject.size,
           });
           debug('revalidated', originUrl);
           if (!servingStale) {
             onEvent?.({ type: 'cache-hit', url: originUrl, stale: false });
-            await serveCachedEntry(refreshedEntry, targetResponse, res, 0);
+            await serveCachedEntry(
+              refreshedEntry,
+              targetResponse,
+              res,
+              metadataInitialAgeSeconds(refreshedMetadata) * 1000
+            );
           }
           return;
         }
@@ -348,12 +379,11 @@ export function createProxyCache({
         targetResponse.setHeader(HTTP_RESPONSE_HEADER_CACHE_STATUS, 'MISS');
         originResponse.headers.forEach((value, key) => {
           if (key === 'content-length' && contentType?.startsWith('text/css')) return;
-          const outputValue = key === 'location' && shouldProxyPath(value) ? encodeProxyPath(value) : value;
+          const outputValue = key === 'location' ? proxyLocation(value) : value;
           targetResponse.setHeader(key, outputValue);
         });
 
-        const redirected =
-          300 < originResponse.status && originResponse.status < 400 && originResponse.headers.has('location');
+        const redirected = isRedirectStatus(originResponse.status) && originResponse.headers.has('location');
         if (!originResponse.ok && !redirected) {
           debug(`Failed ${originResponse.ok} | ${originResponse.status} | ${originResponse.statusText}`);
           targetResponse.send(originResponse.statusText);
@@ -361,9 +391,10 @@ export function createProxyCache({
         }
 
         const cachePolicy = parseCacheControl(responseHeaders['cache-control']);
-        if (!canStoreSharedResponse(cachePolicy)) {
+        const varyStar = variesOnWildcard(responseHeaders.vary);
+        if (!canStoreSharedResponse(cachePolicy) || varyStar) {
           if (cacheObject) await cacache.rm.entry(cachePath, cacheKey);
-          const reason = cachePolicy.noStore ? 'no-store' : 'private';
+          const reason = cachePolicy.noStore ? 'no-store' : cachePolicy.isPrivate ? 'private' : 'vary-star';
           onEvent?.({ type: 'cache-skip', url: originUrl, reason });
           const responseStream = makeProxyReplacementStream(
             originResponse.body,
@@ -383,8 +414,10 @@ export function createProxyCache({
         const cacheWriteStream = cacache.put.stream(cachePath, cacheKey, {
           metadata: {
             cssTransformed,
+            cssTransformFingerprint: cssTransformed ? cssTransformFingerprint : undefined,
             originUrl,
             headers: responseHeaders,
+            initialAgeSeconds: parseAgeSeconds(responseHeaders.age),
             status: originResponse.status,
           } satisfies CacheMetadata,
         }) as unknown as NodeJS.WritableStream & { destroy(error?: Error): void };
@@ -420,6 +453,11 @@ export function createProxyCache({
         targetResponse.send(`Error during request for ${originUrl}:\n${error.message}`);
       } finally {
         abortContext.dispose();
+      }
+
+      function proxyLocation(value: string): string {
+        const resolved = resolveLocation(originUrl, value);
+        return shouldProxyPath(resolved) ? encodeProxyPath(resolved) : resolved;
       }
     }
 
@@ -483,15 +521,19 @@ export function createProxyCache({
       .replace(/^\//, '')
       .replace(/^http\//, 'http://');
     if (!/^https?:/i.test(originUrl)) originUrl = `https://${originUrl}`;
-    if (originUrl.includes('?')) {
-      const [pʹ, queryString, hash] = originUrl.match(/(.+)\?(.+)(#.*)?/)!.slice(1);
-      originUrl = pʹ + (hash || '');
-      new URLSearchParams(queryString).forEach((value, key) => {
-        query[key] = value;
-      });
+    let originSearch = typeof query.search === 'string' ? query.search : undefined;
+    const queryIndex = originUrl.indexOf('?');
+    if (queryIndex >= 0) {
+      const hashIndex = originUrl.indexOf('#', queryIndex);
+      const queryEnd = hashIndex >= 0 ? hashIndex : originUrl.length;
+      const proxyQuery = new URLSearchParams(originUrl.slice(queryIndex + 1, queryEnd));
+      originSearch = proxyQuery.get('search') ?? originSearch;
+      originUrl = originUrl.slice(0, queryIndex) + originUrl.slice(queryEnd);
     }
-    if (query.search) {
-      originUrl += `?${decodeURIComponent(query.search as string)}`;
+    if (originSearch !== undefined) {
+      const hashIndex = originUrl.indexOf('#');
+      const insertionPoint = hashIndex >= 0 ? hashIndex : originUrl.length;
+      originUrl = `${originUrl.slice(0, insertionPoint)}?${originSearch}${originUrl.slice(insertionPoint)}`;
     }
     return originUrl;
   }
@@ -528,8 +570,6 @@ export function createProxyCache({
       accept,
       'accept-language': 'en-US,en;q=0.9',
       'accept-encoding': 'gzip, deflate',
-      'user-agent':
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Safari/605.1.15',
     };
     const req = {
       headers: reqHeaders,
@@ -560,12 +600,20 @@ export function createProxyCache({
       private collectsBody() {
         return this.headers['content-type']?.startsWith('text/css') === true;
       }
+      streamError?: Error;
+      _destroy(error: Error | null, callback: (error?: Error | null) => void) {
+        this.streamError = error ?? undefined;
+        callback();
+      }
     })();
 
     debug(`warm cache for ${url}`);
     await cdnProxyRouter(req, res);
+    if (res.streamError) {
+      return { status: 502, ok: false, headers: res.headers, data: Buffer.alloc(0) };
+    }
     const status = res.statusCode!;
-    const redirected = 300 < status && status < 400 && res.headers.location?.startsWith(`${proxyPrefix}/`);
+    const redirected = isRedirectStatus(status) && res.headers.location?.startsWith(`${proxyPrefix}/`);
     if (redirected) {
       const location = decodeProxyPath(res.headers.location);
       debug(`following redirect from ${url} -> ${location}`);
@@ -822,6 +870,21 @@ function normalizeAccept(value: string | string[] | undefined): string {
   return normalized || '*/*';
 }
 
+function normalizeAcceptLanguage(value: string | string[] | undefined): string | null {
+  const normalized = headerValue(value)
+    ?.split(',')
+    .map((part) =>
+      part
+        .trim()
+        .replace(/^([^;]+)/, (languageRange) => languageRange.toLowerCase())
+        .replace(/\s*;\s*/g, ';')
+        .replace(/\s*=\s*/g, '=')
+    )
+    .filter(Boolean)
+    .join(', ');
+  return normalized || null;
+}
+
 function normalizeAcceptEncoding(value: string | string[] | undefined): string | null {
   const encodings = new Map<string, number>();
   for (const part of headerValue(value)?.split(',') ?? []) {
@@ -847,6 +910,33 @@ function normalizeAcceptEncoding(value: string | string[] | undefined): string |
 
 function headerValue(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value.join(',') : value;
+}
+
+function isRedirectStatus(status: number): boolean {
+  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
+
+function resolveLocation(originUrl: string, location: string): string {
+  try {
+    return new URL(location, originUrl).toString();
+  } catch (error) {
+    if (error instanceof TypeError) return location;
+    throw error;
+  }
+}
+
+function variesOnWildcard(value: string | undefined): boolean {
+  return value?.split(',').some((field) => field.trim() === '*') ?? false;
+}
+
+function parseAgeSeconds(value: string | undefined): number {
+  if (!value || !/^\d+$/.test(value)) return 0;
+  const seconds = Number(value);
+  return Number.isSafeInteger(seconds) ? seconds : 0;
+}
+
+function metadataInitialAgeSeconds(metadata: CacheMetadata): number {
+  return metadata.initialAgeSeconds ?? parseAgeSeconds(metadata.headers.age);
 }
 
 function removeArrayDuplicates<T>(array: T[]): T[] {

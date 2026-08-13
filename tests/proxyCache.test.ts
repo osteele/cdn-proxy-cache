@@ -70,6 +70,11 @@ describe('CDN Proxy', () => {
     test('decodes query parameters', () =>
       testRoundtripEquality('https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js?a=1&b=2'));
 
+    test('preserves percent-encoded query values', () => {
+      testRoundtripEquality('https://cdn.jsdelivr.net/file?next=https%3A%2F%2Fexample.com%2Fa%3Fb%3D1&literal=%252F');
+      testRoundtripEquality('https://cdn.jsdelivr.net/file?invalid=%ZZ');
+    });
+
     test('preserves hashes', () => {
       testRoundtripEquality('https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js#hash');
       testRoundtripEquality('https://cdn.jsdelivr.net/npm/p5@1.4/lib/p5.min.js?a=1&b=2#hash');
@@ -277,6 +282,35 @@ describe('CDN Proxy', () => {
       }
     });
 
+    test('follows relative redirects while warming', async () => {
+      let targetRequests = 0;
+      const server = http.createServer((req, res) => {
+        if (req.url === '/start') {
+          res.statusCode = 302;
+          res.setHeader('location', './asset');
+          res.end('redirect');
+        } else if (req.url === '/asset') {
+          targetRequests++;
+          res.end('asset');
+        } else {
+          res.statusCode = 404;
+          res.end();
+        }
+      });
+      const origin = await listen(server);
+      const cache = createLocalCache(origin, [`${origin}/start`]);
+
+      try {
+        const stats = await cache.warm({});
+        expect(stats.failures).toBe(0);
+        expect(targetRequests).toBe(1);
+        expect(Object.keys(await cache.ls())).toHaveLength(2);
+      } finally {
+        await cache.clear();
+        await close(server);
+      }
+    });
+
     test('revalidates cached responses with origin validators', async () => {
       let requests = 0;
       let conditionalRequests = 0;
@@ -330,6 +364,51 @@ describe('CDN Proxy', () => {
       }
     });
 
+    test('partitions cached responses by accept-language', async () => {
+      let requests = 0;
+      const server = http.createServer((req, res) => {
+        requests++;
+        res.setHeader('cache-control', 'max-age=60');
+        res.setHeader('vary', 'Accept-Language');
+        res.end(req.headers['accept-language'] ?? 'none');
+      });
+      const origin = await listen(server);
+      const cache = createLocalCache(origin, []);
+
+      try {
+        const english = await requestCache(cache, `${origin}/asset`, { 'accept-language': 'en-US' });
+        const french = await requestCache(cache, `${origin}/asset`, { 'accept-language': 'fr-FR' });
+        const englishAgain = await requestCache(cache, `${origin}/asset`, { 'accept-language': 'en-us' });
+        expect(english.body).toBe('en-us');
+        expect(french.body).toBe('fr-fr');
+        expect(englishAgain.body).toBe('en-us');
+        expect(requests).toBe(2);
+      } finally {
+        await cache.clear();
+        await close(server);
+      }
+    });
+
+    test('does not store responses with Vary wildcard', async () => {
+      let requests = 0;
+      const server = http.createServer((_req, res) => {
+        requests++;
+        res.setHeader('vary', '*');
+        res.end(`asset ${requests}`);
+      });
+      const origin = await listen(server);
+      const cache = createLocalCache(origin, []);
+
+      try {
+        expect((await requestCache(cache, `${origin}/asset`)).body).toBe('asset 1');
+        expect((await requestCache(cache, `${origin}/asset`)).body).toBe('asset 2');
+        expect(Object.keys(await cache.ls())).toHaveLength(0);
+      } finally {
+        await cache.clear();
+        await close(server);
+      }
+    });
+
     test('stores rewritten CSS so cache hits do not repeat the transformation', async () => {
       let assetChecks = 0;
       const server = http.createServer((_req, res) => {
@@ -357,6 +436,34 @@ describe('CDN Proxy', () => {
         expect(stored.toString()).toContain('/__proxy_cache/http/127.0.0.1');
       } finally {
         await cache.clear();
+        await close(server);
+      }
+    });
+
+    test('invalidates transformed CSS when the transformation configuration changes', async () => {
+      let requests = 0;
+      const server = http.createServer((_req, res) => {
+        requests++;
+        res.setHeader('cache-control', 'max-age=60');
+        res.setHeader('content-type', 'text/css');
+        res.end(`body { background: url("${origin}/asset.png"); }`);
+      });
+      const origin = await listen(server);
+      const cachePath = path.join(os.tmpdir(), `cdn-proxy-cache-test-${randomUUID()}`);
+      const baseOptions = {
+        cachePath,
+        cacheSeeds: [],
+        shouldProxyPath: (url: string) => url.startsWith(`${origin}/`),
+      };
+      const firstCache = createProxyCache({ ...baseOptions, proxyPrefix: '/cache-one' });
+      const secondCache = createProxyCache({ ...baseOptions, proxyPrefix: '/cache-two' });
+
+      try {
+        expect((await requestCache(firstCache, `${origin}/style.css`)).body).toContain('/cache-one/');
+        expect((await requestCache(secondCache, `${origin}/style.css`)).body).toContain('/cache-two/');
+        expect(requests).toBe(2);
+      } finally {
+        await secondCache.clear();
         await close(server);
       }
     });
@@ -413,6 +520,45 @@ describe('CDN Proxy', () => {
         }
       });
     }
+
+    test('includes the origin Age when deciding whether to revalidate', async () => {
+      let requests = 0;
+      const server = http.createServer((_req, res) => {
+        requests++;
+        res.setHeader('age', '60');
+        res.setHeader('cache-control', 'max-age=60, must-revalidate');
+        res.end(`response ${requests}`);
+      });
+      const origin = await listen(server);
+      const cache = createLocalCache(origin, []);
+
+      try {
+        expect((await requestCache(cache, `${origin}/asset`)).body).toBe('response 1');
+        expect((await requestCache(cache, `${origin}/asset`)).body).toBe('response 2');
+        expect(requests).toBe(2);
+      } finally {
+        await cache.clear();
+        await close(server);
+      }
+    });
+
+    test('reports CSS transformation stream failures during warming', async () => {
+      const server = http.createServer((_req, res) => {
+        res.setHeader('content-type', 'text/css');
+        res.end('body { color: red; }');
+      });
+      const origin = await listen(server);
+      const cache = createLocalCache(origin, [`${origin}/style.css`], { maxCssTransformBytes: 8 });
+
+      try {
+        const stats = await cache.warm({});
+        expect(stats.failures).toBe(1);
+        expect(Object.keys(await cache.ls())).toHaveLength(0);
+      } finally {
+        await cache.clear();
+        await close(server);
+      }
+    });
 
     test('bounds cache-warming concurrency', async () => {
       let active = 0;
