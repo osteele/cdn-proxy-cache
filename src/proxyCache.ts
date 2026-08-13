@@ -1,7 +1,7 @@
 import type { IncomingHttpHeaders } from 'node:http';
 import stream from 'node:stream';
 import * as cacache from 'cacache';
-import fetch from 'node-fetch';
+import type nodeFetch from 'node-fetch';
 import { parse as parseHtml } from 'node-html-parser';
 import { multiplexStreamWriter } from './helpers/stream-helpers';
 import { cacheLifetimeSeconds, canStoreSharedResponse, parseCacheControl } from './internal/cache-control';
@@ -17,6 +17,10 @@ import path = require('node:path');
 import assert = require('node:assert');
 
 const debug = require('debug')('cdn-proxy-cache');
+// A bare node-fetch import is replaced by Bun's fetch shim, which eagerly
+// decompresses response bodies even when compress is false. The cache needs
+// the package implementation so stored bytes match the relayed headers.
+const fetch: typeof nodeFetch = require('node-fetch/lib/index.js');
 const MAX_REDIRECTS = 20;
 const DEFAULT_MAX_CSS_TRANSFORM_BYTES = 5 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -149,6 +153,7 @@ export interface RequestI {
 
 /** The express.Response properties that cdnProxyRouter depends on. */
 export interface ResponseI extends NodeJS.WritableStream {
+  readonly writableFinished?: boolean;
   destroy(error?: Error): void;
   setHeader(key: string, value: string | number | readonly string[]): void;
   send(chunk: string | Buffer): void;
@@ -405,7 +410,7 @@ export function createProxyCache({
           );
           responseStream.on('error', (error) => targetResponse.destroy(error));
           responseStream.pipe(targetResponse);
-          await Promise.all([waitForReadable(responseStream), waitForWritable(targetResponse)]);
+          await settleStreamOperations([waitForReadable(responseStream), waitForWritable(targetResponse)]);
           return;
         }
 
@@ -434,7 +439,8 @@ export function createProxyCache({
         const sinkComplete = waitForWritable(responseSink);
         const targetComplete = waitForWritable(targetResponse);
         responseStream.pipe(responseSink);
-        const [bytes] = await Promise.all([cacheCommitted, responseComplete, sinkComplete, targetComplete]);
+        await settleStreamOperations([cacheCommitted, responseComplete, sinkComplete, targetComplete]);
+        const bytes = await cacheCommitted;
         debug('wrote', bytes, 'bytes to cache for', originUrl);
         onEvent?.({ type: 'cache-write', url: originUrl, bytes });
       } catch (cause) {
@@ -488,8 +494,14 @@ export function createProxyCache({
             transformCssUrl,
             maxCssTransformBytes
           );
-      cachedStream.on('error', (error) => errorResponse.destroy(error));
-      const completion = waitForWritable(response);
+      const onCachedStreamError = (error: Error) => errorResponse.destroy(error);
+      const onResponseError = (error: Error) => destroyReadable(cachedStream, error);
+      cachedStream.once('error', onCachedStreamError);
+      response.once('error', onResponseError);
+      const completion = waitForWritable(response).finally(() => {
+        cachedStream.off('error', onCachedStreamError);
+        response.off('error', onResponseError);
+      });
       cachedStream.pipe(response);
       return completion;
     }
@@ -789,23 +801,88 @@ export function createProxyCache({
 
 function waitForReadable(readable: NodeJS.ReadableStream): Promise<void> {
   return new Promise((resolve, reject) => {
-    readable.once('end', resolve);
-    readable.once('error', reject);
+    const cleanup = () => {
+      readable.off('end', onEnd);
+      readable.off('error', onError);
+      readable.off('close', onClose);
+    };
+    const onEnd = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new Error('Readable stream closed before ending'));
+    };
+    readable.once('end', onEnd);
+    readable.once('error', onError);
+    readable.once('close', onClose);
   });
 }
 
 function waitForWritable(writable: NodeJS.WritableStream): Promise<void> {
   return new Promise((resolve, reject) => {
-    writable.once('finish', resolve);
-    writable.once('error', reject);
+    const cleanup = () => {
+      writable.off('finish', onFinish);
+      writable.off('error', onError);
+      writable.off('close', onClose);
+    };
+    const onFinish = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new Error('Writable stream closed before finishing'));
+    };
+    writable.once('finish', onFinish);
+    writable.once('error', onError);
+    writable.once('close', onClose);
   });
 }
 
 function waitForCacheCommit(writable: NodeJS.WritableStream): Promise<number> {
   return new Promise((resolve, reject) => {
-    writable.once('size', resolve);
-    writable.once('error', reject);
+    const cleanup = () => {
+      writable.off('size', onSize);
+      writable.off('error', onError);
+      writable.off('close', onClose);
+    };
+    const onSize = (size: number) => {
+      cleanup();
+      resolve(size);
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new Error('Cache stream closed before committing'));
+    };
+    writable.once('size', onSize);
+    writable.once('error', onError);
+    writable.once('close', onClose);
   });
+}
+
+async function settleStreamOperations(operations: Promise<unknown>[]): Promise<void> {
+  const results = await Promise.allSettled(operations);
+  const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+  if (failure) throw toError(failure.reason);
+}
+
+function destroyReadable(readable: NodeJS.ReadableStream, error: Error): void {
+  const destroyable = readable as NodeJS.ReadableStream & { destroy?(cause?: Error): void };
+  destroyable.destroy?.(error);
 }
 
 function createCacheWriteStream(cachePath: string, cacheKey: string, metadata: CacheMetadata): stream.Writable {
@@ -816,14 +893,17 @@ function createCacheWriteStream(cachePath: string, cacheKey: string, metadata: C
         destination = cacache.put.stream(cachePath, cacheKey, { metadata }) as unknown as NodeJS.WritableStream & {
           destroy(error?: Error): void;
         };
-        destination.on('size', (size) => writer.emit('size', size));
         destination.on('error', (error) => writer.destroy(error));
       }
       destination.write(chunk, encoding, callback);
     },
     final(callback) {
       if (destination) {
-        destination.end(callback);
+        destination.once('size', (size) => {
+          writer.emit('size', size);
+          callback();
+        });
+        destination.end();
         return;
       }
       cacache.put(cachePath, cacheKey, Buffer.alloc(0), { metadata }).then(
@@ -848,6 +928,7 @@ function createAbortContext(req: RequestI, res: ResponseI | undefined, timeoutMs
   let timedOut = false;
   const abortFromSignal = () => controller.abort(abortReason(req.signal!));
   const abortFromClient = () => {
+    if (res?.writableFinished) return;
     clientAborted = true;
     controller.abort(new Error('Client disconnected'));
   };

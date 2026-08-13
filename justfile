@@ -30,6 +30,14 @@ mutation-dry:
 mutation:
     bun run mutation
 
+# Verify the stream-slice mutation setup without executing mutants
+mutation-stream-dry:
+    bun run mutation:stream:dry
+
+# Run mutation testing for stream transformation and failure handling
+mutation-stream:
+    bun run mutation:stream
+
 # Type check
 typecheck:
     bun run typecheck

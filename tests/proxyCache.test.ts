@@ -149,7 +149,7 @@ describe('CDN Proxy', () => {
   });
 
   describe('content encoding', () => {
-    for (const encoding of ['deflate', 'gzip'] as const) {
+    for (const encoding of ['deflate', 'gzip', 'x-gzip'] as const) {
       test(`rewrites ${encoding}-encoded CSS through the production stream`, async () => {
         const css = Buffer.from('body { background: url("https://cdn.jsdelivr.net/asset.png"); }');
         const compressed = encoding === 'deflate' ? zlib.deflateSync(css) : zlib.gzipSync(css);
@@ -187,6 +187,37 @@ describe('CDN Proxy', () => {
         8
       );
       await expect(fromReadable(outputStream)).rejects.toThrow('8-byte transformation limit');
+    });
+
+    test('passes non-CSS content through without transforming it', async () => {
+      const transformUrl = spyOn({ transformUrl: () => undefined }, 'transformUrl');
+      const input = stream.Readable.from('plain text');
+      const outputStream = makeProxyReplacementStream(input, 'text/plain', undefined, transformUrl);
+
+      expect(outputStream).toBe(input);
+      expect(await fromReadable(outputStream)).toBe('plain text');
+      expect(transformUrl).not.toHaveBeenCalled();
+    });
+
+    test('recognizes CSS content types with parameters', async () => {
+      const outputStream = makeProxyReplacementStream(
+        stream.Readable.from('body { background: url("https://cdn.jsdelivr.net/asset.png"); }'),
+        'text/css; charset=utf-8',
+        undefined,
+        (url) => (isCdnUrl(url) ? testCache.encodeProxyPath(url) : undefined)
+      );
+
+      expect((await fromReadable(outputStream)).toString()).toContain('/__proxy_cache/cdn.jsdelivr.net/asset.png');
+    });
+
+    test('forwards gzip source errors to the output stream', async () => {
+      const input = new stream.PassThrough();
+      const outputStream = makeProxyReplacementStream(input, 'text/css', 'gzip', () => undefined);
+      const completion = fromReadable(outputStream);
+
+      input.destroy(new Error('origin body failed'));
+
+      await expect(completion).rejects.toThrow('origin body failed');
     });
   });
 

@@ -16,13 +16,15 @@ Status values: `pending`, `in-progress`, `evidenced`, `deferred`, `blocked`, `no
 | Field | Value |
 | --- | --- |
 | Scope | Entire `cdn-proxy-cache` package |
-| Baseline | Commit `fbd70a2e` plus the current contract/model-suite working copy |
+| Baseline | Commits through the stream-fault and runtime-compatibility slice |
 | Started | 2026-08-13 |
 | Last updated | 2026-08-13 |
 | Size | Small: 1,409 source lines, one package, one primary stateful component |
-| Current automated evidence | 48 tests, 3,489 assertions, `just check`, `just build`, and a 121-mutant bounded StrykerJS baseline |
+| Current automated evidence | 63 tests, 3,534 assertions, `just check`, `just build`, Node CommonJS smoke test, npm pack inspection, and two bounded StrykerJS slices |
 
 This repository is small enough for a bounded whole-project audit. Its HTTP semantics, persistent cache, streams, and concurrency still merit separate focused passes.
+
+Development uses Bun 1.3.14 for package management, scripts, and tests. npm remains the publication format and registry; the built CommonJS library must remain compatible with the Node extension host used by the VS Code consumer. Bun and Node must execute the same network implementation rather than relying on Bun's bare-import substitution for `node-fetch`.
 
 ## Area inventory
 
@@ -33,15 +35,15 @@ This repository is small enough for a bounded whole-project audit. Its HTTP sema
 | AREA-003 | HTTP cache policy and freshness | High | in-progress | Fresh/stale/no-cache/no-store/private/must-revalidate/`Vary: *`/`Age` tests; reference model | `Date` and corrected-age calculations; directives listed as unsupported; 304 policy changes; request directives; absent freshness metadata |
 | AREA-004 | Representation selection and cache keys | High | in-progress | `Accept`, `Accept-Encoding`, and `Accept-Language` canonicalization/partition tests | Formal `Accept` ordering semantics; unsupported `Vary` fields; wildcard/identity encoding edge cases; header grammar fuzzing |
 | AREA-005 | Stored representations and migration | High | in-progress | CSS transformation fingerprint regression; digest reads; empty-body regression | Legacy metadata matrix; corrupt/missing content; configuration changes captured by closures; schema/version migration policy |
-| AREA-006 | Streams, compression, and transformation | High | in-progress | Plain/gzip/deflate CSS; corrupt compression; size limit; error propagation; non-CSS streaming; zero-length body | Cache-writer failure injection; client disconnect during each phase; truncated origin bodies; unknown/stacked encodings; backpressure and listener cleanup |
+| AREA-006 | Streams, compression, and transformation | High | evidenced | Plain/gzip/x-gzip/deflate CSS; opaque Brotli/stacked encodings; corrupt/truncated input; cache-writer and client faults; backpressure, finalization, and listener cleanup; 100% bounded mutation score | Broader client-disconnect timing and prolonged randomized fault stress belong to AREA-007 |
 | AREA-007 | Concurrency, coalescing, cancellation, and cleanup | High | in-progress | Concurrent cold misses; stale bursts; warming concurrency; timeout and abort tests; modeled bursts | Revalidation bursts; per-client cancellation during shared work; cache clear during requests; event ordering; race/fault stress campaign |
 | AREA-008 | Cache warming and dependency discovery | Medium | in-progress | CSS dependency discovery, queue deduplication, redirects/cycles, failures, cancellation | CSS import variants; query/fragment deduplication; redirect status matrix; dependency failure aggregation; reload/force combinations |
 | AREA-009 | Security and trust boundaries | High | in-progress | Decoded-origin allowlist enforcement; refused URL test | Proxy-prefix boundary semantics; malformed paths; redirect allowlist transitions; header injection; cache-path assumptions; denial-of-service bounds |
 | AREA-010 | Commands, diagnostics, and observability | Medium | in-progress | Command failure behavior; cache-info relative path; lifecycle event test | All event branches/order; output snapshots; empty cache; corrupt/legacy metadata; diagnostic-header collision behavior |
-| AREA-011 | Packaging and runtime compatibility | Medium | in-progress | CI matrix declares Node 18–26 and Express 4–5; package build passes | Run packed-consumer matrix or a representative local package smoke test; verify npm contents and CommonJS loading after current changes |
+| AREA-011 | Packaging and runtime compatibility | Medium | in-progress | Bun is declared as the development package manager; build passes; built CommonJS loads under Node; npm dry-run tarball contains the expected 20 files | Run installed-tarball smoke tests across representative supported Node/Express combinations |
 | AREA-012 | Documentation consistency | Medium | in-progress | README and cache-policy documentation reconciled in `fbd70a2e` | Turn remaining feature/limitation statements into contract rows; compare examples and templates to runtime behavior |
 | AREA-013 | Performance and resource bounds | Medium | pending | Performance notes and bounded warming test | Reproducible benchmark harness; memory limits; backpressure evidence; cache growth and cleanup behavior |
-| AREA-014 | Mutation testing | High | in-progress | StrykerJS 9.6.1 command runner with Bun: 121 mutants, 108 killed, 13 classified survivors, 89.26% raw score | Expand from cache policy/codec into stream and queue slices after their contract/fault oracles are ready |
+| AREA-014 | Mutation testing | High | in-progress | Policy/codec baseline: 121 mutants, 89.26%, 13 classified survivors; finalized stream slice: 49 mutants, 100%, no survivors | Add a queue/concurrency slice after its state/fault oracle is ready |
 | AREA-015 | Independent structured review passes | High | pending | One general review and one model-suite implementation pass | Run two non-overlapping passes after the matrix is populated; require no new medium-or-higher findings |
 
 ## Invariants and contracts
@@ -52,7 +54,7 @@ This repository is small enough for a bounded whole-project audit. Its HTTP sema
 | INV-002 | Every fetched origin URL, including redirect and CSS dependency transitions, satisfies `shouldProxyPath` | README `shouldProxyPath` contract | in-progress | Rejected direct URL, relative redirect, and CSS discovery tests | Cross-origin/disallowed redirects and malformed `Location` remain pending |
 | INV-003 | Requests documented as equivalent share a cache entry; distinct representation selectors do not | README request flow | in-progress | Encoding canonicalization and language partition tests; model key checks | `Accept` grammar and additional `Vary` values remain pending |
 | INV-004 | A cache hit is observationally equivalent to the successful miss that populated it, except documented diagnostics and freshness headers | README request flow | in-progress | Reference model compares body, status, cache status, entry count, and origin count | Full response-header equivalence and redirect responses remain pending |
-| INV-005 | Failed, canceled, private, non-storable, or incomplete responses do not leave reusable partial entries | README policy/limits | in-progress | `no-store`, private, `Vary: *`, oversized CSS, timeout, abort, and stream failure tests | Cache-writer faults, truncated bodies, and client disconnects remain pending |
+| INV-005 | Failed, canceled, private, non-storable, or incomplete responses do not leave reusable partial entries | README policy/limits | evidenced | `no-store`, private, `Vary: *`, oversized CSS, timeout, abort, decompressor/source/cache-writer failures, truncation, and client disconnect tests | Prolonged concurrent fault stress remains under AREA-007 |
 | INV-006 | Freshness and revalidation follow the documented cache policy | README router contract | in-progress | Fresh, stale, ETag/304, `no-cache`, `must-revalidate`, and origin `Age` tests/model | Corrected age using `Date`, 304 policy updates, and unsupported directives remain pending |
 | INV-007 | Concurrent cold or stale requests do not multiply origin transfers beyond the documented coalescing semantics | README features | in-progress | Eight-request cold and stale bursts plus modeled transitions | Revalidation bursts, cancellation, and failure of the shared request remain pending |
 | INV-008 | Cached transformed CSS is reused only under a compatible transformation configuration | README request flow | evidenced | Fingerprint regression across proxy-prefix changes | Closed-over callback changes require the documented `cssTransformVersion` discipline |
@@ -65,8 +67,8 @@ This repository is small enough for a bounded whole-project audit. Its HTTP sema
 
 | ID | Specification boundary | Why it fits | Status |
 | --- | --- | --- | --- |
-| SPEC-001 | Proxy-path codec and URL-rewrite decisions | Pure input/output relations, round trips, and allowlist decisions | authored and propagated in `specs/proxy-path-codec.allium`; CLI unavailable, so obligations were checked manually against Allium v3 and mapped to `tests/proxyCache.contract.test.ts` |
-| SPEC-002 | Proxy-cache lifecycle | Stateful sequences over absent/fresh/stale/revalidating/non-storable entries map directly to the reference model | authored and propagated in `specs/proxy-cache-lifecycle.allium`; mapped to the contract and reference-model suites; CLI unavailable |
+| SPEC-001 | Proxy-path codec and URL-rewrite decisions | Pure input/output relations, round trips, and allowlist decisions | authored and propagated; Allium CLI 3.5.3 `check`, `analyse`, `plan`, and `model` are clean; three generated signature obligations map to `tests/proxyCache.contract.test.ts` |
+| SPEC-002 | Proxy-cache lifecycle | Stateful sequences over absent/fresh/stale/revalidating/non-storable entries map directly to the reference model | authored and propagated; CLI parse/plan/model succeed and analysis finds no conflicts, but `check` reports 12 modeling diagnostics: two warnings and ten informational items for an unbound external entity, unused fields/entity, and externally sourced triggers |
 | SPEC-003 | Cache-warming queue | Queue/deduplication/redirect/failure transitions are stateful, but concurrency bounds and stream faults may need external tests | pending |
 
 Distill current behavior only after labeling intentional semantics versus accidental implementation details. Use an elicited intended-behavior spec for HTTP policy where documentation or standards are authoritative. Generated tests should complement, not replace, fuzzing and fault injection.
@@ -84,13 +86,13 @@ Distill current behavior only after labeling intentional semantics versus accide
 | CELL-007 | Router | Same URL with header variants | Language/encoding variants | Share or partition correctly | Sequential | in-progress | Language and encoding tests; `Accept` pending |
 | CELL-008 | Router | Cold/stale same key | Cacheable origin | Coalesced result | Concurrent | evidenced | Eight-request bursts/model |
 | CELL-009 | Router | Revalidating same key | ETag/no-cache | Coalescing/revalidation burst | Concurrent | pending | Define expected semantics, then test |
-| CELL-010 | Router | Body mid-stream | Timeout, truncation, client/cache failure | No partial entry; cleanup | Sequential/concurrent | in-progress | Timeout and CSS failure exist; full fault matrix pending |
-| CELL-011 | CSS pipeline | Plain/gzip/deflate | Within/over limit | Rewrite or fail | Streaming | in-progress | Existing tests; unknown/stacked encodings pending |
+| CELL-010 | Router | Body mid-stream | Timeout, truncation, client/cache failure | No partial entry; cleanup | Sequential/concurrent | evidenced | Faults at origin, decompressor, transformer limit, client, and cache writer; incomplete entries rejected and origins torn down |
+| CELL-011 | CSS pipeline | Plain/gzip/x-gzip/deflate/opaque | Within/over limit | Rewrite, pass through, or fail | Streaming | evidenced | Content-type parameters, corrupt/source errors, size bound, Brotli and stacked opaque encodings; mutation slice at 100% |
 | CELL-012 | Redirect | Relative/absolute/cyclic | Allowed/disallowed target | Rewrite/follow/refuse | Sequential/warming | in-progress | Relative and cycle tests; full status/allowlist matrix pending |
 | CELL-013 | Warm queue | Seeds/dependencies/duplicates | Force/reload/concurrency/signal | Stats and termination | Concurrent | in-progress | Core tests exist; option matrix pending |
 | CELL-014 | Persistent cache | Current/legacy/corrupt metadata | Changed transform configuration | Reuse/invalidate/recover | Across instances | in-progress | Transform fingerprint test; legacy/corruption pending |
 | CELL-015 | Commands | Empty/populated/corrupt cache | JSON/verbose/path forms | Stable output/errors | Sequential | pending | Two narrow tests only |
-| CELL-016 | Package | Built tarball | Supported Node/Express versions | Install and load | Runtime matrix | pending | CI configuration exists; current artifact not exercised here |
+| CELL-016 | Package | Built tarball | Supported Node/Express versions | Install and load | Runtime matrix | in-progress | Current CommonJS artifact loads and its codec runs under Node; npm dry-run tarball inspected; installed multi-version matrix pending |
 
 ## Verification campaigns
 
@@ -99,8 +101,9 @@ Distill current behavior only after labeling intentional semantics versus accide
 | CAMP-001 | Contract tests | Current documented cache guarantees | Every README guarantee mapped or flagged ambiguous | in-progress | `specs/*.allium`; `tests/proxyCache.contract.test.ts`; `tests/proxyCache.test.ts` |
 | CAMP-002 | Model/property sequences | Cache lifecycle, policies, variants, mutation, clear, reload | Explicit trace plus 10 deterministic seeds × 30 operations | passing | `tests/proxyCache.model.test.ts` |
 | CAMP-003 | URL property matrix | Supported canonical origin URL grammar | Schemes × authorities × paths × searches × fragments × prefixes; bounded deterministic runtime | passing | 1,512 cases and 3,024 channel comparisons in `tests/proxyCache.contract.test.ts` |
-| CAMP-004 | Stream fault injection | Origin/decompressor/transformer/client/cache writer | One injected failure at each boundary | pending | Partial examples only |
+| CAMP-004 | Stream fault injection | Origin/decompressor/transformer/client/cache writer | One injected failure at each boundary | passing | `tests/proxyCache.stream.test.ts`; incomplete origin, gzip source/decompression, size-bound transformation, disconnect, synchronous/asynchronous cache failures, backpressure, finalization, and listener assertions |
 | CAMP-005 | Mutation testing | Cache policy and URL codec baseline | Baseline high threshold 80%; every survivor classified | passing for selected slice | StrykerJS 9.6.1, Node 24.19.0, Bun 1.3.14; 121 total, 108 killed, 13 survived, 0 timeout/no-coverage/error; 89.26% raw score; `.cache/mutation-report.json` |
+| CAMP-007 | Mutation testing | Stream fan-out, encoding selection, and router cache-write orchestration | At least 80%; every survivor classified | passing | Final bounded scope: 49 mutants, 25 killed, 24 timed out, 0 survived/no-coverage/error, 100%; `.cache/mutation-stream-report.json`. An initial 216-mutant scouting run scored 49.54% and drove scope correction and new oracles |
 | CAMP-006 | Independent structured passes | HTTP semantics; streams/concurrency/security | Two passes with no new medium-or-higher findings | pending | None |
 
 ## Findings
@@ -114,9 +117,14 @@ Distill current behavior only after labeling intentional semantics versus accide
 | FIND-005 | Medium | resolved | INV-008/CELL-014 | Transformed CSS was reused under incompatible configuration | Cross-instance prefix regression | Commit `fbd70a2e` |
 | FIND-006 | Medium | resolved | INV-006/CELL-003 | Freshness ignored the origin `Age` | `Age: 60` revalidation regression | Commit `fbd70a2e` |
 | FIND-007 | Low | resolved | AREA-012 | Cache-policy documentation contradicted behavior | Documentation comparison | Commit `fbd70a2e` |
-| FIND-008 | Medium | fixed-uncommitted | INV-010/CELL-005 | `cacache.put.stream` rejects empty input, so successful 204 responses were never cached | Reference model failed on explicit and generated 204 transitions | Lazy cache writer in current working copy |
-| FIND-009 | Medium | fixed-uncommitted | INV-001/CELL-001 | Prefix lookalikes such as `/__proxy_cache-other` were classified as proxy paths | Propagated prefix-boundary contract and CSS-warming integration test | Segment-aware `isProxyPath` in current working copy |
-| FIND-010 | Medium | fixed-uncommitted | INV-001/CELL-001 | Decoding removed the configured proxy-prefix text when it occurred inside the origin pathname | Generated pathname grammar and CSS-warming regression | Anchored prefix removal in current working copy |
+| FIND-008 | Medium | resolved | INV-010/CELL-005 | `cacache.put.stream` rejects empty input, so successful 204 responses were never cached | Reference model failed on explicit and generated 204 transitions | Lazy empty writer in `f1fb7f15` |
+| FIND-009 | Medium | resolved | INV-001/CELL-001 | Prefix lookalikes such as `/__proxy_cache-other` were classified as proxy paths | Propagated prefix-boundary contract and CSS-warming integration test | Segment-aware `isProxyPath` in `f1fb7f15` |
+| FIND-010 | Medium | resolved | INV-001/CELL-001 | Decoding removed the configured proxy-prefix text when it occurred inside the origin pathname | Generated pathname grammar and CSS-warming regression | Anchored prefix removal in `f1fb7f15` |
+| FIND-011 | High | resolved | AREA-006/AREA-011 | Bun substitutes a bare `node-fetch` import with its native fetch shim, which eagerly decoded Brotli despite `compress: false`, producing runtime behavior different from Node and potentially mismatching cached bytes and headers | Opaque Brotli integration failed under Bun while the actual node-fetch package preserves bytes | Load the pinned node-fetch v2 package entry explicitly; opaque Brotli and stacked-encoding miss/hit tests pass under Bun, and the build loads under Node |
+| FIND-012 | Medium | resolved | INV-004/CELL-010 | The router could complete before cacache's index commit event, allowing an immediate follow-up request to miss nondeterministically | Repeated opaque-encoding miss/hit tests observed `cache-write` followed by an empty index | Complete the wrapper only after cacache emits its post-index `size` event; five repeated fault-suite runs and mutation testing pass |
+| FIND-013 | Medium | resolved | INV-005/CELL-010 | `Promise.all` returned on the first stream failure while sibling stream branches were still settling, causing cleanup races and late errors | Initial client-disconnect fault produced late unhandled abort errors | Await all stream settlements, preserve the first rejection, and treat premature close as failure |
+| FIND-014 | Medium | resolved | INV-005/CELL-010 | A response's normal post-finish `close` event was classified as a client disconnect and could abort a successful cache commit | Repeated opaque response tests intermittently lacked their committed entry | Ignore response close after `writableFinished`; repeated stream suite is stable |
+| FIND-015 | Low | resolved | AREA-006 | Multiplex destinations retained error listeners after successful finalization | Listener-count assertion after two-destination finalization | Remove listeners on finish or close; finalized helper mutation scope scores 100% |
 
 No confirmed findings are currently open. Pending areas have not yet received enough evidence to make that a closure claim.
 
@@ -136,14 +144,18 @@ The raw mutation score is retained. Classification does not rewrite it into an a
 | Equivalent in declared domain | 4 | Cache-control empty fallback, empty directive name, boolean sentinel, and redundant runtime type guard | The parser exposes only recognized directive keys and its internal map values are constrained to `string \| true`; these changes cannot affect the returned policy |
 | Equivalent in declared domain | 6 | Two scheme-replacement anchors, leading-slash anchor, and three `>= 0` to `> 0` index changes | Earlier guards and canonical proxy-path structure make the altered positions unreachable for supported inputs |
 | Outside codec contract | 3 | Two exact-prefix decoding mutations and one non-prefixed decoding mutation | `decodeProxyPath` accepts a path produced by `encodeProxyPath`; a bare prefix and arbitrary non-prefixed strings encode no origin URL. Revisit during the malformed-path security pass |
+| Outside finalized stream slice | 103 | Survivors from the initial 216-mutant exploratory scope | Generic `fromReadable`, broad fetch/catch/abort branches, diagnostics, and cache-writer internals exceeded the declared fan-out/encoding/orchestration slice; they remain in their corresponding ledger areas rather than being silently counted as stream closure evidence |
+| Oracle gaps resolved | 4 | Content-type suffix, gzip source-error forwarding, and two opaque-encoding fallback mutations | Added parameterized content-type, direct source fault, and rewrite-sensitive opaque-body tests; all are killed or timed out in the final run |
+| Redundant implementation removed | 2 | Reverse response-sink error listener mutations | Multiplex failure already destroys the response, whose close handler aborts the origin; removing the duplicate listener left origin-teardown evidence passing |
+| Final stream survivors | 0 | Finalized 49-mutant slice | 25 killed and 24 timed out; no survivors, no-coverage mutants, or errors |
 
 ## Pending work ordered by risk and information gain
 
 | Priority | Area/cell | Why next | Recommended action |
 | --- | --- | --- | --- |
-| 1 | AREA-006/CELL-010 | Stream failures can corrupt responses or persistent state | Add injectable origin, transformer, client-writer, and cache-writer failures, then mutate the covered stream slice |
-| 2 | AREA-009 | Trust-boundary defects can bypass the proxy's main safety property | Audit malformed paths, remaining prefix boundaries, redirects, and header injection |
-| 3 | AREA-011 | Published compatibility is broader than local evidence | Pack and smoke-test representative Node/Express consumer combinations |
+| 1 | AREA-009 | Trust-boundary defects can bypass the proxy's main safety property | Audit malformed paths, remaining prefix boundaries, redirect allowlist transitions, and header injection |
+| 2 | AREA-011 | Published compatibility is broader than one local Node smoke test | Install the packed artifact and exercise representative Node 18/current plus Express 4/5 combinations |
+| 3 | AREA-007/CELL-009 | Shared revalidation and cancellation are the highest remaining stateful race surface | Define expected per-client cancellation semantics, add a reference-model burst, then mutate the queue/coalescing slice |
 
 ## Stop conditions
 
@@ -166,3 +178,4 @@ The audit is not closed.
 | 2026-08-13 | Codex | Finding remediation | `fbd70a2e`; 39 tests passing | Replace example accumulation with a reference model |
 | 2026-08-13 | Codex | Cache lifecycle model | Added explicit trace, 10 seeded traces, and coalescing bursts; found FIND-008 | Formalize contracts, then run mutation baseline |
 | 2026-08-13 | Codex | Allium codec/lifecycle contracts and bounded mutation baseline | Added two specs, propagated contract/property tests, fixed FIND-009/FIND-010, and classified all 13 survivors at 89.26% raw score | Stream fault injection and its mutation slice |
+| 2026-08-13 | Codex | Stream fault and runtime-compatibility slice | Installed Allium 3.5.3; recorded lifecycle-spec diagnostics; fixed FIND-011–FIND-015; final 49-mutant slice scored 100%; Node CommonJS and npm-pack smoke checks passed | AREA-009 malformed-path, redirect, and header-injection audit |

@@ -16,6 +16,7 @@
   },
   "license": "MIT",
   "author": "Oliver Steele <steele@osteele.com> (https://osteele.com/)",
+  "packageManager": "bun@1.3.14",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
@@ -37,6 +38,8 @@
     "lint": "biome check src tests",
     "mutation": "stryker run",
     "mutation:dry": "stryker run --dryRunOnly",
+    "mutation:stream": "stryker run stryker.stream.config.mjs",
+    "mutation:stream:dry": "stryker run stryker.stream.config.mjs --dryRunOnly",
     "format": "biome format --write src tests",
     "format-check": "biome ci src tests",
     "fix": "biome check --write src tests",
