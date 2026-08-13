@@ -17,11 +17,11 @@ build:
 # Smoke-test the packed artifact with an installed Express major
 compatibility-smoke express-version:
     bun run build
-    sh scripts/test-packed-compatibility.sh {{quote(express-version)}}
+    node scripts/test-packed-compatibility.cjs {{quote(express-version)}}
 
 # Run tests
 test:
-    bun test
+    bun run test
 
 # Run tests in watch mode
 test-watch:

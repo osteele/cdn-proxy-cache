@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Testing
 
 - Added Allium contracts, generated codec/lifecycle contract tests, a cache reference model, adversarial trust-boundary tests, and bounded StrykerJS mutation slices that run through Bun.
+- Added mixed-process tests for Bun-to-Node warm visibility, warm-to-serve reuse, overlapping cold writes, and recovery after a writer is terminated before commit.
 - Replaced the import-only compatibility check with installed-tarball tests that exercise CommonJS and ES module imports, public declarations, packaged templates, and real cache misses and hits across supported Node.js and Express versions.
 - Added shared-generation cancellation contracts, deterministic owner/follower schedules, and a focused mutation campaign for cleanup and retry behavior.
 

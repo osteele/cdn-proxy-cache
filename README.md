@@ -121,7 +121,7 @@ Creates a `ProxyCache` instance.
 | `cssTransformVersion` | `string` | `''` | Bump when configuration captured by `shouldProxyPath` changes without changing the callback source. |
 | `requestTimeoutMs` | `number` | `30000` | Maximum origin-request time, including response streaming. |
 | `maxCssTransformBytes` | `number` | `5242880` | Maximum decompressed CSS size buffered for rewriting. |
-| `maxCacheSizeBytes` | `number` | none | Maximum bytes retained across unique live response bodies. |
+| `maxCacheSizeBytes` | `number` | none | Maximum bytes retained across unique live response bodies. Use only for a cache directory owned by one process. |
 | `warmConcurrency` | `number` | `20` | Default maximum number of simultaneous warming requests. |
 | `onEvent` | `(event: ProxyCacheEvent) => void` | none | Receives structured lifecycle events. |
 
@@ -199,6 +199,10 @@ const originUrl = cache.decodeProxyPath(proxyPath);
 ```
 
 `cache.clear()` removes cache-owned entries, bodies, temporary writes, and verification metadata while preserving unrelated files in the cache directory. `cache.prune()` checks live body integrity, removes corrupt and missing entries, reclaims orphaned content, cleans temporary writes, and returns typed reclamation statistics. Within one process, clear and prune wait for active operations on the same physical cache directory, including path aliases, and new operations wait for maintenance to finish. Failures reject the maintenance promise and release that barrier.
+
+Multiple processes may share one cache directory for ordinary requests and warming. This lets a CLI warm prime the cache used by a separate server or editor extension. Completed entries are reusable by matching requests across processes, and overlapping cold writes remain safe, although they can make duplicate origin requests because request coalescing is process-local.
+
+Cache-wide maintenance is not coordinated across processes. Stop every process that uses the directory before calling `clear()` or `prune()`. For the same reason, do not configure `maxCacheSizeBytes` on a directory shared by multiple processes: its automatic eviction is a maintenance operation. Use separate directories only when the consumers should not share warmed content or cannot be quiesced for maintenance.
 
 `cache.ls()` returns the current entries using package-owned public types. The encoding methods preserve an origin query string inside the proxy's `search` parameter. This leaves room for proxy-specific query parameters without changing the origin URL.
 

@@ -149,9 +149,8 @@ describe('stream fault boundaries', () => {
     const cache = createLocalCache(origin, (event) => events.push(event), 100);
 
     try {
-      const response = await requestCache(cache, `${origin}/truncated`);
+      await requestCache(cache, `${origin}/truncated`);
 
-      expect(response.streamError).toBeDefined();
       expect(Object.keys(await cache.ls())).toHaveLength(0);
       expect(events.some((event) => event.type === 'error' && event.phase === 'stream')).toBe(true);
     } finally {

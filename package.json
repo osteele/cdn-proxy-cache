@@ -30,11 +30,11 @@
     "url": "https://github.com/osteele/cdn-proxy-cache.git"
   },
   "scripts": {
-    "build": "rm -rf dist && tsc --declaration && cp -R src/templates dist/templates",
+    "build": "rm -rf dist && bun node_modules/typescript/lib/tsc.js --declaration && cp -R src/templates dist/templates",
     "clean": "rm -rf dist",
-    "test": "bun test",
+    "test": "bun test && bun test ./tests/proxyCache.process.integration.ts",
     "test:watch": "bun test --watch",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "bun node_modules/typescript/lib/tsc.js --noEmit",
     "lint": "biome check src tests",
     "mutation": "stryker run",
     "mutation:dry": "stryker run --dryRunOnly",
@@ -49,7 +49,7 @@
     "format": "biome format --write src tests",
     "format-check": "biome ci src tests",
     "fix": "biome check --write src tests",
-    "check": "bun run format-check && bun run lint && bun run typecheck && bun test",
+    "check": "bun run format-check && bun run lint && bun run typecheck && bun run test",
     "prepublishOnly": "bun run check && bun run build"
   },
   "dependencies": {

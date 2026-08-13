@@ -45,7 +45,10 @@ export type ProxyCacheOptions = {
   cssTransformVersion?: string;
   /** Maximum decompressed CSS size that may be buffered for rewriting. */
   maxCssTransformBytes?: number;
-  /** Maximum total size of unique live response bodies retained in the cache. */
+  /**
+   * Maximum total size of unique live response bodies retained in the cache.
+   * Use only when one process owns the cache directory.
+   */
   maxCacheSizeBytes?: number;
   /** Receives structured cache lifecycle events. */
   onEvent?: (event: ProxyCacheEvent) => void;

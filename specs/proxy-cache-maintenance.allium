@@ -1,7 +1,8 @@
 -- allium: 3
 -- proxy-cache-maintenance.allium
 --
--- Scope: Observable cache-wide maintenance and resource-bound lifecycle.
+-- Scope: Observable same-process cache-wide maintenance and resource-bound
+-- lifecycle. Callers quiesce other processes before using these operations.
 -- Includes: operation quiescence, clear, prune, unique-body accounting,
 -- eviction, successful completion, and failure recovery.
 -- Excludes: cacache directory layout, checksum algorithm, and platform-specific
@@ -20,8 +21,8 @@ contract ProxyCacheMaintenance {
 
     @invariant ExclusiveMaintenance
         -- Clear and prune begin only after operations that already hold the
-        -- same cache path have settled. New operations wait until maintenance
-        -- completes or fails.
+        -- same cache path in this process have settled. New same-process
+        -- operations wait until maintenance completes or fails.
 
     @invariant CompleteClear
         -- Successful clear leaves zero live entries and zero live cached body

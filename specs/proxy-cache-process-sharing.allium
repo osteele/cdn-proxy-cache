@@ -1,0 +1,117 @@
+-- allium: 3
+-- proxy-cache-process-sharing.allium
+--
+-- Scope: Multiple processes using one cache directory for ordinary requests
+-- and warming.
+-- Includes: committed-entry visibility, overlapping writes, interrupted
+-- writes, and the maintenance precondition.
+-- Excludes: cross-process request coalescing, distributed locking, and
+-- maintenance while another process is using the directory.
+--
+-- Authority: The public shared-cache contract. Filesystem behavior is
+-- verified by mixed-process integration tests.
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract SharedProcessCache {
+    serve: String -> Boolean
+    warm: String -> Boolean
+
+    @invariant CommittedEntryVisibility
+        -- Once one process successfully commits an entry, another process
+        -- using the same directory and representation key can reuse it without
+        -- an origin request.
+
+    @invariant ConcurrentWriteIntegrity
+        -- Overlapping cold writes may duplicate origin work, but after they
+        -- settle the shared key resolves to a complete reusable body.
+
+    @invariant InterruptedWriteIsolation
+        -- Terminating a process before commit does not make its partial body
+        -- visible as a live cache entry or prevent a later successful write.
+
+    @invariant ExternallyQuiescedMaintenance
+        -- Clear, prune, and configured byte-bound enforcement require every
+        -- other process using the directory to be stopped by the caller.
+}
+
+------------------------------------------------------------
+-- Entities and transitions
+------------------------------------------------------------
+
+entity SharedEntry {
+    state: absent | committed
+
+    transitions state {
+        absent -> committed
+    }
+}
+
+entity SharedWrite {
+    state: idle | writing | completed | interrupted
+
+    transitions state {
+        idle -> writing
+        writing -> completed
+        writing -> interrupted
+    }
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule BeginColdWrite {
+    when: CacheMiss(entry, write)
+    requires: entry.state = absent
+    requires: write.state = idle
+    ensures: entry.state = absent
+    ensures: write.state = writing
+}
+
+rule JoinOverlappingWrite {
+    when: CacheMiss(entry, write)
+    requires: entry.state = absent
+    requires: write.state = idle
+    requires: AnotherWriteIsActive(entry)
+    ensures: entry.state = absent
+    ensures: write.state = writing
+}
+
+rule CommitWrite {
+    when: CompleteBodyStored(entry, write)
+    requires: entry.state = absent
+    requires: write.state = writing
+    ensures: entry.state = committed
+    ensures: write.state = completed
+}
+
+rule CompleteOverlappingWrite {
+    when: CompleteBodyStored(entry, write)
+    requires: entry.state = committed
+    requires: write.state = writing
+    ensures: entry.state = committed
+    ensures: write.state = completed
+}
+
+rule InterruptIncompleteWrite {
+    when: WriterTerminated(entry, write)
+    requires: write.state = writing
+    ensures: entry.state = entry.state
+    ensures: write.state = interrupted
+}
+
+rule ReuseCommittedEntry {
+    when: CacheRequest(entry)
+    requires: entry.state = committed
+    ensures: entry.state = committed
+}
+
+rule BeginQuiescentMaintenance {
+    when: MaintenanceRequested(entry)
+    requires: AllOtherProcessesStopped()
+    requires: NoWriteIsActive(entry)
+    ensures: entry.state = entry.state
+}
