@@ -115,16 +115,19 @@ Creates a `ProxyCache` instance.
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `proxyPrefix` | `string` | required | URL prefix mounted on the Express application. |
-| `cachePath` | `string` | required | Directory used for cached content and metadata. |
+| `cachePath` | `string` | required | Directory used for cached content and metadata; resolved to its canonical physical path at construction. |
 | `cacheSeeds` | `string[]` | required | Starting URLs for `cache.warm()`. Use an empty array when warming is not needed. |
 | `shouldProxyPath` | `(url: string) => boolean` | required | Return `true` for URLs that the cache may rewrite and proxy. |
 | `cssTransformVersion` | `string` | `''` | Bump when configuration captured by `shouldProxyPath` changes without changing the callback source. |
 | `requestTimeoutMs` | `number` | `30000` | Maximum origin-request time, including response streaming. |
 | `maxCssTransformBytes` | `number` | `5242880` | Maximum decompressed CSS size buffered for rewriting. |
+| `maxCacheSizeBytes` | `number` | none | Maximum bytes retained across unique live response bodies. |
 | `warmConcurrency` | `number` | `20` | Default maximum number of simultaneous warming requests. |
 | `onEvent` | `(event: ProxyCacheEvent) => void` | none | Receives structured lifecycle events. |
 
-The three numeric options must be positive integers. An origin timeout produces HTTP 504 if response headers have not been sent. CSS that exceeds `maxCssTransformBytes` fails the response and emits a stream error event.
+Configured numeric options must be positive integers. `cachePath` must not be empty, a filesystem root (including through a symlink), or contain a dangling symlink. An origin timeout produces HTTP 504 if response headers have not been sent. CSS that exceeds `maxCssTransformBytes` fails the response and emits a stream error event.
+
+When `maxCacheSizeBytes` is configured, the cache counts content-addressed response bodies rather than index entries, so entries that share identical content consume the body size once. After a mutating request settles, the cache removes the oldest unique bodies until it is within the bound. A response larger than the bound is delivered but not retained.
 
 ### `cache.router(req, res)`
 
@@ -185,6 +188,8 @@ The returned `CacheWarmStats` contains `total`, `hits`, `misses`, and `failures`
 ```typescript
 await cache.clear();
 
+const pruneStats = await cache.prune();
+
 const entries = await cache.ls();
 
 cache.isProxyPath('/__proxy_cache/cdn.jsdelivr.net/example.js');
@@ -193,7 +198,9 @@ const proxyPath = cache.encodeProxyPath('https://cdn.jsdelivr.net/example.js');
 const originUrl = cache.decodeProxyPath(proxyPath);
 ```
 
-`cache.ls()` returns the underlying `cacache.ls()` result. The encoding methods preserve an origin query string inside the proxy's `search` parameter. This leaves room for proxy-specific query parameters without changing the origin URL.
+`cache.clear()` removes cache-owned entries, bodies, temporary writes, and verification metadata while preserving unrelated files in the cache directory. `cache.prune()` checks live body integrity, removes corrupt and missing entries, reclaims orphaned content, cleans temporary writes, and returns typed reclamation statistics. Within one process, clear and prune wait for active operations on the same physical cache directory, including path aliases, and new operations wait for maintenance to finish. Failures reject the maintenance promise and release that barrier.
+
+`cache.ls()` returns the current entries using package-owned public types. The encoding methods preserve an origin query string inside the proxy's `search` parameter. This leaves room for proxy-specific query parameters without changing the origin URL.
 
 ## Lifecycle events
 

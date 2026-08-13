@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added cache pruning with typed reclamation statistics and an optional unique-body byte bound with oldest-body eviction.
+
 ### Changed
 
 - Canonicalized `Accept` and `Accept-Encoding` cache-key values so equivalent requests share entries.
@@ -15,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Made clear and prune exclusive with active same-process cache operations, including filesystem aliases, removed cache-owned temporary artifacts during clear, and rejected unsafe cache paths.
 - Removed a transitive `@types/cacache` requirement from the public declarations returned by `ProxyCache.ls()`.
 - Coalesced simultaneous misses and stale refreshes for the same cache key.
 - Revalidated cached responses with `ETag` and `Last-Modified` validators and reused cached bodies after `304 Not Modified` responses.

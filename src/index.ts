@@ -1,5 +1,6 @@
 export { clearCache, listCache, showCacheInfo, warmCache } from './commands';
 export {
+  type CachePruneStats,
   type CacheWarmMessage,
   type CacheWarmStats,
   createProxyCache,

@@ -1,3 +1,5 @@
+import { lstatSync, realpathSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
 import type { IncomingHttpHeaders } from 'node:http';
 import stream from 'node:stream';
 import * as cacache from 'cacache';
@@ -5,6 +7,7 @@ import type nodeFetch from 'node-fetch';
 import type { Headers } from 'node-fetch';
 import { parse as parseHtml } from 'node-html-parser';
 import { multiplexStreamWriter } from './helpers/stream-helpers';
+import { AsyncReadWriteLock } from './internal/async-read-write-lock';
 import { cacheLifetimeSeconds, canStoreSharedResponse, parseCacheControl } from './internal/cache-control';
 import {
   cssForEachUrl,
@@ -27,6 +30,12 @@ const DEFAULT_MAX_CSS_TRANSFORM_BYTES = 5 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_WARM_CONCURRENCY = 20;
 const TRANSFORMED_CSS_ENCODINGS = new Set([undefined, 'deflate', 'gzip', 'x-gzip']);
+const cacheLocks = new Map<string, WeakRef<AsyncReadWriteLock>>();
+const cacheLockFinalizer = new FinalizationRegistry<{ canonicalPath: string; reference: WeakRef<AsyncReadWriteLock> }>(
+  ({ canonicalPath, reference }) => {
+    if (cacheLocks.get(canonicalPath) === reference) cacheLocks.delete(canonicalPath);
+  }
+);
 
 //#region exported types
 export type ProxyCacheOptions = {
@@ -36,6 +45,8 @@ export type ProxyCacheOptions = {
   cssTransformVersion?: string;
   /** Maximum decompressed CSS size that may be buffered for rewriting. */
   maxCssTransformBytes?: number;
+  /** Maximum total size of unique live response bodies retained in the cache. */
+  maxCacheSizeBytes?: number;
   /** Receives structured cache lifecycle events. */
   onEvent?: (event: ProxyCacheEvent) => void;
   proxyPrefix: string;
@@ -76,6 +87,7 @@ export type ProxyCache = {
 
   // cache management methods
   clear: () => Promise<void>;
+  prune: () => Promise<CachePruneStats>;
   warm: (options: WarmCacheOptions, callback?: (message: CacheWarmMessage) => void) => Promise<CacheWarmStats>;
   ls: () => Promise<Record<string, ProxyCacheEntry>>;
 
@@ -83,6 +95,17 @@ export type ProxyCache = {
 
   decodeProxyPath: (url: string, query?: RequestI['query']) => string;
   encodeProxyPath: (url: string) => string;
+};
+
+export type CachePruneStats = {
+  badContentCount: number;
+  keptSize: number;
+  missingContent: number;
+  reclaimedCount: number;
+  reclaimedSize: number;
+  rejectedEntries: number;
+  totalEntries: number;
+  verifiedContent: number;
 };
 
 export type WarmCacheOptions = {
@@ -223,16 +246,21 @@ export function createProxyCache({
   cachePath,
   cacheSeeds,
   cssTransformVersion = '',
+  maxCacheSizeBytes,
   maxCssTransformBytes = DEFAULT_MAX_CSS_TRANSFORM_BYTES,
   onEvent,
   requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   shouldProxyPath,
   warmConcurrency = DEFAULT_WARM_CONCURRENCY,
 }: ProxyCacheOptions): ProxyCache {
+  const cacheLocation = canonicalCachePath(cachePath);
+  cachePath = cacheLocation.path;
   requirePositiveInteger('maxCssTransformBytes', maxCssTransformBytes);
+  if (maxCacheSizeBytes !== undefined) requirePositiveInteger('maxCacheSizeBytes', maxCacheSizeBytes);
   requirePositiveInteger('requestTimeoutMs', requestTimeoutMs);
   requirePositiveInteger('warmConcurrency', warmConcurrency);
   const inFlightRequests = new Map<string, Promise<boolean>>();
+  const cacheLock = getCacheLock(cacheLocation.lockKey);
   const cssTransformFingerprint = JSON.stringify({
     schema: 1,
     proxyPrefix,
@@ -243,23 +271,50 @@ export function createProxyCache({
   return {
     cachePath,
     proxyPrefix,
-    clear: () => cacache.rm.all(cachePath),
-    router: cdnProxyRouter,
+    clear: clearCache,
+    prune: pruneCache,
+    router: routeWithMaintenance,
     replaceUrlsInHtml,
     replaceUrlsInCss,
     warm: warmCache,
-    ls: cacache.ls.bind(cacache, cachePath),
+    ls: listCacheEntries,
     isProxyPath,
     decodeProxyPath,
     encodeProxyPath,
   };
+
+  async function clearCache(): Promise<void> {
+    await cacheLock.withWrite(async () => {
+      await cacache.rm.all(cachePath);
+      await Promise.all([
+        rm(path.join(cachePath, 'tmp'), { recursive: true, force: true }),
+        rm(path.join(cachePath, '_lastverified'), { force: true }),
+      ]);
+    });
+  }
+
+  async function pruneCache(): Promise<CachePruneStats> {
+    return cacheLock.withWrite(async () => normalizePruneStats(await cacache.verify(cachePath)));
+  }
+
+  async function listCacheEntries(): Promise<Record<string, ProxyCacheEntry>> {
+    return cacheLock.withRead(() => cacache.ls(cachePath));
+  }
+
+  async function routeWithMaintenance(req: RequestI, res: ResponseI): Promise<void> {
+    const context = { storageChanged: false };
+    await cacheLock.withRead(() => cdnProxyRouter(req, res, context));
+    if (context.storageChanged && maxCacheSizeBytes !== undefined) {
+      await cacheLock.withWrite(() => enforceCacheSize(maxCacheSizeBytes));
+    }
+  }
 
   // Note that express.Request implements RequestI, and express.Response
   // implements ResponseI.
   //
   // This function uses the more general type to allow prefetch to call
   // cdnProxyRouter.
-  async function cdnProxyRouter(req: RequestI, res: ResponseI): Promise<void> {
+  async function cdnProxyRouter(req: RequestI, res: ResponseI, context: { storageChanged: boolean }): Promise<void> {
     if (req.signal?.aborted) throw abortReason(req.signal);
     if (req.aborted || res.destroyed) return;
     let targetResponse = res;
@@ -305,6 +360,7 @@ export function createProxyCache({
         (metadata.cssTransformed && metadata.cssTransformFingerprint !== cssTransformFingerprint)
       ) {
         await cacache.rm.entry(cachePath, cacheKey);
+        context.storageChanged = true;
         cacheObject = null;
       } else {
         const { headers } = metadata;
@@ -316,6 +372,7 @@ export function createProxyCache({
         const requiresRevalidation = cannotReuse || policy.noCache || (expired && policy.mustRevalidate);
         if (cannotReuse) {
           await cacache.rm.entry(cachePath, cacheKey);
+          context.storageChanged = true;
           cacheObject = null;
         }
 
@@ -358,7 +415,7 @@ export function createProxyCache({
           if (req.signal?.aborted) throw abortReason(req.signal);
           return;
         }
-        return cdnProxyRouter(outcome === 'reusable' ? requestWithoutReload(req) : req, res);
+        return cdnProxyRouter(outcome === 'reusable' ? requestWithoutReload(req) : req, res, context);
       } finally {
         waiterAbortContext.dispose();
       }
@@ -426,6 +483,7 @@ export function createProxyCache({
             metadata: refreshedMetadata,
             size: cacheObject.size,
           });
+          context.storageChanged = true;
           debug('revalidated', originUrl);
           if (!servingStale) {
             onEvent?.({ type: 'cache-hit', url: originUrl, stale: false });
@@ -458,7 +516,10 @@ export function createProxyCache({
         const cachePolicy = parseCacheControl(responseHeaders['cache-control']);
         const varyStar = variesOnWildcard(responseHeaders.vary);
         if (!canStoreSharedResponse(cachePolicy) || varyStar) {
-          if (cacheObject) await cacache.rm.entry(cachePath, cacheKey);
+          if (cacheObject) {
+            await cacache.rm.entry(cachePath, cacheKey);
+            context.storageChanged = true;
+          }
           const reason = cachePolicy.noStore ? 'no-store' : cachePolicy.isPrivate ? 'private' : 'vary-star';
           onEvent?.({ type: 'cache-skip', url: originUrl, reason });
           const responseStream = makeProxyReplacementStream(
@@ -502,6 +563,7 @@ export function createProxyCache({
         responseStream.pipe(responseSink);
         await settleStreamOperations([cacheCommitted, responseComplete, sinkComplete, targetComplete]);
         const bytes = await cacheCommitted;
+        context.storageChanged = true;
         debug('wrote', bytes, 'bytes to cache for', originUrl);
         onEvent?.({ type: 'cache-write', url: originUrl, bytes });
         return true;
@@ -572,6 +634,33 @@ export function createProxyCache({
       cachedStream.pipe(response);
       return completion;
     }
+  }
+
+  async function enforceCacheSize(maxBytes: number): Promise<void> {
+    const entries = Object.values(await cacache.ls(cachePath));
+    const bodies = new Map<string, { keys: string[]; size: number; newestTime: number }>();
+    for (const entry of entries) {
+      const body = bodies.get(entry.integrity);
+      if (body) {
+        body.keys.push(entry.key);
+        body.size = Math.max(body.size, entry.size);
+        body.newestTime = Math.max(body.newestTime, entry.time);
+      } else {
+        bodies.set(entry.integrity, { keys: [entry.key], size: entry.size, newestTime: entry.time });
+      }
+    }
+    let totalBytes = [...bodies.values()].reduce((sum, body) => sum + body.size, 0);
+    if (totalBytes <= maxBytes) return;
+    const oldestFirst = [...bodies.entries()].sort(
+      ([leftIntegrity, left], [rightIntegrity, right]) =>
+        left.newestTime - right.newestTime || leftIntegrity.localeCompare(rightIntegrity)
+    );
+    for (const [, body] of oldestFirst) {
+      await Promise.all(body.keys.map((key) => cacache.rm.entry(cachePath, key)));
+      totalBytes -= body.size;
+      if (totalBytes <= maxBytes) break;
+    }
+    await cacache.verify(cachePath);
   }
 
   //#region proxy paths
@@ -689,7 +778,7 @@ export function createProxyCache({
     })();
 
     debug(`warm cache for ${url}`);
-    await cdnProxyRouter(req, res);
+    await routeWithMaintenance(req, res);
     if (res.streamError) {
       return { status: 502, ok: false, headers: res.headers, data: Buffer.alloc(0) };
     }
@@ -709,7 +798,7 @@ export function createProxyCache({
   }
 
   async function getCachedUrls(): Promise<string[]> {
-    const cache = await cacache.ls(cachePath);
+    const cache = await listCacheEntries();
     return Object.values(cache).map((value) => (value.metadata as CacheMetadata).originUrl);
   }
 
@@ -1069,6 +1158,100 @@ function requirePositiveInteger(name: string, value: number): void {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new RangeError(`${name} must be a positive integer`);
   }
+}
+
+function canonicalCachePath(cachePath: string): { path: string; lockKey: string } {
+  if (cachePath.trim().length === 0) throw new RangeError('cachePath must not be empty');
+  const resolved = path.resolve(cachePath);
+  const missingSegments: string[] = [];
+  let existingAncestor = resolved;
+  let canonicalPath: string;
+  let canonicalAncestor: string;
+  while (true) {
+    try {
+      canonicalAncestor = realpathSync(existingAncestor);
+      canonicalPath = path.join(canonicalAncestor, ...missingSegments.reverse());
+      break;
+    } catch (cause) {
+      const error = cause as NodeJS.ErrnoException;
+      if (error.code !== 'ENOENT') throw cause;
+      try {
+        if (lstatSync(existingAncestor).isSymbolicLink()) {
+          throw new RangeError('cachePath must not contain a dangling symbolic link');
+        }
+      } catch (statCause) {
+        const statError = statCause as NodeJS.ErrnoException;
+        if (statError.code !== 'ENOENT') throw statCause;
+      }
+      const parent = path.dirname(existingAncestor);
+      if (parent === existingAncestor) throw cause;
+      missingSegments.push(path.basename(existingAncestor));
+      existingAncestor = parent;
+    }
+  }
+  if (canonicalPath === path.parse(canonicalPath).root) {
+    throw new RangeError('cachePath must not be a filesystem root');
+  }
+  const lockKey = isCaseInsensitivePath(canonicalAncestor)
+    ? canonicalPath.normalize('NFD').toLowerCase()
+    : canonicalPath;
+  return { path: canonicalPath, lockKey };
+}
+
+function isCaseInsensitivePath(existingPath: string): boolean {
+  let candidate = existingPath;
+  while (true) {
+    const parent = path.dirname(candidate);
+    if (parent === candidate) return process.platform === 'win32';
+    const basename = path.basename(candidate);
+    const toggled = toggleFirstAsciiLetter(basename);
+    if (toggled !== basename) {
+      try {
+        return realpathSync(path.join(parent, toggled)) === realpathSync(candidate);
+      } catch (cause) {
+        const error = cause as NodeJS.ErrnoException;
+        if (error.code !== 'ENOENT') throw cause;
+        return false;
+      }
+    }
+    candidate = parent;
+  }
+}
+
+function toggleFirstAsciiLetter(value: string): string {
+  const index = value.search(/[A-Za-z]/);
+  if (index < 0) return value;
+  const letter = value[index];
+  const toggled = letter === letter.toLowerCase() ? letter.toUpperCase() : letter.toLowerCase();
+  return `${value.slice(0, index)}${toggled}${value.slice(index + 1)}`;
+}
+
+function getCacheLock(lockKey: string): AsyncReadWriteLock {
+  const existing = cacheLocks.get(lockKey)?.deref();
+  if (existing) return existing;
+  const lock = new AsyncReadWriteLock();
+  const reference = new WeakRef(lock);
+  cacheLocks.set(lockKey, reference);
+  cacheLockFinalizer.register(lock, { canonicalPath: lockKey, reference });
+  return lock;
+}
+
+function normalizePruneStats(value: unknown): CachePruneStats {
+  const stats = value as Record<keyof CachePruneStats, unknown>;
+  return {
+    badContentCount: numericStat(stats.badContentCount),
+    keptSize: numericStat(stats.keptSize),
+    missingContent: numericStat(stats.missingContent),
+    reclaimedCount: numericStat(stats.reclaimedCount),
+    reclaimedSize: numericStat(stats.reclaimedSize),
+    rejectedEntries: numericStat(stats.rejectedEntries),
+    totalEntries: numericStat(stats.totalEntries),
+    verifiedContent: numericStat(stats.verifiedContent),
+  };
+}
+
+function numericStat(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
 function normalizeAccept(value: string | string[] | undefined): string {

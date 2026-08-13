@@ -59,6 +59,14 @@ mutation-concurrency-dry:
 mutation-concurrency:
     bun run mutation:concurrency
 
+# Verify the cache-resource mutation setup without executing mutants
+mutation-resources-dry:
+    bun run mutation:resources:dry
+
+# Run mutation testing for maintenance barriers and storage bounds
+mutation-resources:
+    bun run mutation:resources
+
 # Type check
 typecheck:
     bun run typecheck

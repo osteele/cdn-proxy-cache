@@ -44,6 +44,8 @@
     "mutation:security:dry": "stryker run stryker.security.config.mjs --dryRunOnly",
     "mutation:concurrency": "stryker run stryker.concurrency.config.mjs",
     "mutation:concurrency:dry": "stryker run stryker.concurrency.config.mjs --dryRunOnly",
+    "mutation:resources": "stryker run stryker.resources.config.mjs && stryker run stryker.lock.config.mjs",
+    "mutation:resources:dry": "stryker run stryker.resources.config.mjs --dryRunOnly && stryker run stryker.lock.config.mjs --dryRunOnly",
     "format": "biome format --write src tests",
     "format-check": "biome ci src tests",
     "fix": "biome check --write src tests",

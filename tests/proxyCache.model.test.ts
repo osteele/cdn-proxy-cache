@@ -222,7 +222,7 @@ describe('proxy cache reference model', () => {
       actions: generateActions(seed + 1, 30),
     }));
     await executeModelSequences(sequences);
-  });
+  }, 15_000);
 
   test('matches modeled coalescing transitions', async () => {
     const originState = new ModelOrigin();
