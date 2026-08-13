@@ -22,6 +22,14 @@ test:
 test-watch:
     bun test --watch
 
+# Verify the Bun command-runner mutation setup without executing mutants
+mutation-dry:
+    bun run mutation:dry
+
+# Run the bounded mutation baseline configured in stryker.config.mjs
+mutation:
+    bun run mutation
+
 # Type check
 typecheck:
     bun run typecheck

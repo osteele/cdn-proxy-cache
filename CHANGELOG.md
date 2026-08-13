@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Partitioned shared entries by `Accept-Language`, rejected `Vary: *`, and stopped forwarding browser user agents.
 - Invalidated transformed CSS when its proxy transformation configuration changes.
 - Included the origin's `Age` value in freshness and revalidation decisions.
+- Cached successful zero-length responses instead of repeatedly fetching them after `cacache` rejected an empty stream.
+- Treated only complete proxy-prefix path segments as proxy paths and preserved matching text inside origin pathnames.
+
+### Testing
+
+- Added Allium contracts, generated codec/lifecycle contract tests, a cache reference model, and a bounded StrykerJS mutation baseline that runs through Bun.
 
 ### Performance
 

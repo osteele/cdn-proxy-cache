@@ -220,6 +220,38 @@ describe('CDN Proxy', () => {
       }
     });
 
+    test('treats proxy-prefix lookalikes in CSS as relative origin paths', async () => {
+      let origin = '';
+      let assetRequests = 0;
+      const requests: string[] = [];
+      const server = http.createServer((req, res) => {
+        requests.push(req.url ?? '');
+        if (req.url === '/style.css') {
+          res.setHeader('content-type', 'text/css');
+          res.end('body { background: url("/__proxy_cache-other/asset.png"); }');
+        } else if (req.url === '/__proxy_cache-other/asset.png') {
+          assetRequests++;
+          res.setHeader('content-type', 'image/png');
+          res.end('asset');
+        } else {
+          res.statusCode = 404;
+          res.end();
+        }
+      });
+      origin = await listen(server);
+      const cache = createLocalCache(origin, [`${origin}/style.css`]);
+
+      try {
+        const stats = await cache.warm({});
+        expect(requests).toEqual(['/style.css', '/__proxy_cache-other/asset.png']);
+        expect(stats).toEqual({ total: 2, failures: 0, hits: 0, misses: 2 });
+        expect(assetRequests).toBe(1);
+      } finally {
+        await cache.clear();
+        await close(server);
+      }
+    });
+
     test('serves fresh responses from cache', async () => {
       let requests = 0;
       const server = http.createServer((_req, res) => {

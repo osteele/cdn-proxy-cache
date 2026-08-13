@@ -35,6 +35,8 @@
     "test:watch": "bun test --watch",
     "typecheck": "tsc --noEmit",
     "lint": "biome check src tests",
+    "mutation": "stryker run",
+    "mutation:dry": "stryker run --dryRunOnly",
     "format": "biome format --write src tests",
     "format-check": "biome ci src tests",
     "fix": "biome check --write src tests",
@@ -51,6 +53,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.8",
+    "@stryker-mutator/core": "9.6.1",
     "@types/cacache": "^20.0.1",
     "@types/css-tree": "^3.2.0",
     "@types/debug": "^4.1.13",

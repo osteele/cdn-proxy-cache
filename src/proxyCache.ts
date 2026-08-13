@@ -208,7 +208,7 @@ export function createProxyCache({
     replaceUrlsInCss,
     warm: warmCache,
     ls: cacache.ls.bind(cacache, cachePath),
-    isProxyPath: (url) => url.startsWith(proxyPrefix),
+    isProxyPath,
     decodeProxyPath,
     encodeProxyPath,
   };
@@ -411,16 +411,15 @@ export function createProxyCache({
 
         const cssTransformed =
           contentType?.startsWith('text/css') === true && TRANSFORMED_CSS_ENCODINGS.has(contentEncoding);
-        const cacheWriteStream = cacache.put.stream(cachePath, cacheKey, {
-          metadata: {
-            cssTransformed,
-            cssTransformFingerprint: cssTransformed ? cssTransformFingerprint : undefined,
-            originUrl,
-            headers: responseHeaders,
-            initialAgeSeconds: parseAgeSeconds(responseHeaders.age),
-            status: originResponse.status,
-          } satisfies CacheMetadata,
-        }) as unknown as NodeJS.WritableStream & { destroy(error?: Error): void };
+        const cacheMetadata = {
+          cssTransformed,
+          cssTransformFingerprint: cssTransformed ? cssTransformFingerprint : undefined,
+          originUrl,
+          headers: responseHeaders,
+          initialAgeSeconds: parseAgeSeconds(responseHeaders.age),
+          status: originResponse.status,
+        } satisfies CacheMetadata;
+        const cacheWriteStream = createCacheWriteStream(cachePath, cacheKey, cacheMetadata);
         const cacheCommitted = waitForCacheCommit(cacheWriteStream);
         const responseStream = makeProxyReplacementStream(
           originResponse.body,
@@ -516,10 +515,13 @@ export function createProxyCache({
 
   // exported for unit testing
   function decodeProxyPath(proxyPath: string, query: RequestI['query'] = {}): string {
-    let originUrl = proxyPath
-      .replace(proxyPrefix, '')
-      .replace(/^\//, '')
-      .replace(/^http\//, 'http://');
+    const pathWithoutPrefix =
+      proxyPath === proxyPrefix
+        ? ''
+        : proxyPath.startsWith(`${proxyPrefix}/`)
+          ? proxyPath.slice(proxyPrefix.length)
+          : proxyPath;
+    let originUrl = pathWithoutPrefix.replace(/^\//, '').replace(/^http\//, 'http://');
     if (!/^https?:/i.test(originUrl)) originUrl = `https://${originUrl}`;
     let originSearch = typeof query.search === 'string' ? query.search : undefined;
     const queryIndex = originUrl.indexOf('?');
@@ -539,7 +541,7 @@ export function createProxyCache({
   }
 
   function isProxyPath(url: string): boolean {
-    return url.startsWith(proxyPrefix);
+    return url === proxyPrefix || url.startsWith(`${proxyPrefix}/`);
   }
 
   //#endregion
@@ -804,6 +806,40 @@ function waitForCacheCommit(writable: NodeJS.WritableStream): Promise<number> {
     writable.once('size', resolve);
     writable.once('error', reject);
   });
+}
+
+function createCacheWriteStream(cachePath: string, cacheKey: string, metadata: CacheMetadata): stream.Writable {
+  let destination: (NodeJS.WritableStream & { destroy(error?: Error): void }) | undefined;
+  const writer = new stream.Writable({
+    write(chunk, encoding, callback) {
+      if (!destination) {
+        destination = cacache.put.stream(cachePath, cacheKey, { metadata }) as unknown as NodeJS.WritableStream & {
+          destroy(error?: Error): void;
+        };
+        destination.on('size', (size) => writer.emit('size', size));
+        destination.on('error', (error) => writer.destroy(error));
+      }
+      destination.write(chunk, encoding, callback);
+    },
+    final(callback) {
+      if (destination) {
+        destination.end(callback);
+        return;
+      }
+      cacache.put(cachePath, cacheKey, Buffer.alloc(0), { metadata }).then(
+        () => {
+          writer.emit('size', 0);
+          callback();
+        },
+        (error: unknown) => callback(toError(error))
+      );
+    },
+    destroy(error, callback) {
+      if (error) destination?.destroy(error);
+      callback(error);
+    },
+  });
+  return writer;
 }
 
 function createAbortContext(req: RequestI, res: ResponseI | undefined, timeoutMs: number) {
