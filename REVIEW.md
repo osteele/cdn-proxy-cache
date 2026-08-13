@@ -42,7 +42,7 @@ Resolved: Malformed and credential-bearing targets reaching policy or network wo
 
 Remaining gaps: Installed-package compatibility, cache-path ownership and symlink assumptions, input and cache-growth limits, and deeper cancellation races.
 
-## 2026-08-13 — installed-package compatibility
+## 2026-08-13 — `cd52c6a9`
 
 Scope: The packed CommonJS artifact under the minimum and current Node.js runtimes with both supported Express major versions.
 
