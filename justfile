@@ -38,6 +38,14 @@ mutation-stream-dry:
 mutation-stream:
     bun run mutation:stream
 
+# Verify the security-slice mutation setup without executing mutants
+mutation-security-dry:
+    bun run mutation:security:dry
+
+# Run mutation testing for URL and response-header trust boundaries
+mutation-security:
+    bun run mutation:security
+
 # Type check
 typecheck:
     bun run typecheck

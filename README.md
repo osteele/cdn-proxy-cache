@@ -73,6 +73,7 @@ app.listen(3000);
 ```
 
 `shouldProxyPath` is the proxy allowlist. Rewriting methods leave rejected URLs unchanged. Requests that address a rejected URL through `cache.router` receive HTTP 403.
+Malformed, credential-bearing, or non-HTTP proxy targets receive HTTP 400 before the allowlist or network is consulted. The router and rewriting methods pass only canonical HTTP(S) URLs without embedded credentials to `shouldProxyPath`.
 
 ## Cache warming
 
@@ -135,6 +136,8 @@ Responses include these diagnostic headers:
 - `x-cdn-proxy-origin-url`: decoded origin URL.
 
 The cache does not store responses marked `no-store` or `private`, or responses with `Vary: *`. It fetches `no-cache` responses before serving them. Expired responses marked `must-revalidate` are also fetched before they are served. Other expired responses are served immediately and refreshed in the background.
+
+The proxy removes hop-by-hop response headers, fields named by `Connection`, origin-wide state headers such as `Strict-Transport-Security`, `Clear-Site-Data`, authentication challenges, and cookies that would otherwise affect the proxy application's origin. Origin responses cannot replace the proxy diagnostic headers. The origin's `Server` value is exposed as `Origin-Server`.
 
 ### `cache.replaceUrlsInHtml(html)`
 

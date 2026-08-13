@@ -2,6 +2,7 @@ import type { IncomingHttpHeaders } from 'node:http';
 import stream from 'node:stream';
 import * as cacache from 'cacache';
 import type nodeFetch from 'node-fetch';
+import type { Headers } from 'node-fetch';
 import { parse as parseHtml } from 'node-html-parser';
 import { multiplexStreamWriter } from './helpers/stream-helpers';
 import { cacheLifetimeSeconds, canStoreSharedResponse, parseCacheControl } from './internal/cache-control';
@@ -106,27 +107,51 @@ export type CacheWarmMessage =
 //#endregion
 
 export const HTTP_RESPONSE_HEADER_CACHE_STATUS = 'x-cdn-proxy-cache-hit';
+const HTTP_RESPONSE_HEADER_ORIGIN_URL = 'x-cdn-proxy-origin-url';
 
-// Response headers that should not be stored in the cache.
-const uncacheableResponseHeaders = [
+// Origin-specific and hop-by-hop response headers must not be presented as
+// properties of the proxy server. Connection can nominate additional fields;
+// those are added per response below.
+const unrelayedResponseHeaders = new Set([
   'accept-ranges', // the proxy does not implement ranges, even if the origin does
 
-  // Connection and hop-by-hop request headers depend on the server engine, not
+  // Connection and hop-by-hop response headers depend on the server engine, not
   // the proxy middleware or the cached value
   'connection',
   'keep-alive',
+  'proxy-authentication-info',
+  'proxy-connection',
   'proxy-authenticate',
+  'te',
   'trailer',
   'upgrade', // TODO: should this disable the proxy?
 
   'alt-svc',
 
+  'accept-ch',
+  'authentication-info',
+  'clear-site-data',
+  'critical-ch',
+  'nel',
+  'report-to',
+  'reporting-endpoints',
+  'set-cookie',
+  'set-cookie2',
   'strict-transport-security',
   'transfer-encoding',
+  'www-authenticate',
 
+  // These fields describe the proxy and cannot be supplied by an origin.
+  HTTP_RESPONSE_HEADER_CACHE_STATUS,
+  HTTP_RESPONSE_HEADER_ORIGIN_URL,
+]);
+
+// Response headers that should not be stored in the shared cache.
+const uncacheableResponseHeaders = new Set([
+  ...unrelayedResponseHeaders,
   // 'content-accept-ranges',
   'content-length', // this can change from cached value when the server rewrites the urls
-];
+]);
 
 // Request headers that are passed through to the proxied request. Other headers
 // are ignored, in order to assure that the cached response can be shared
@@ -169,6 +194,8 @@ type CacheMetadata = {
   /** Age reported by the origin when this representation was stored or revalidated. */
   initialAgeSeconds?: number;
   originUrl: string;
+  /** True when unsafe origin response headers were removed before storage. */
+  responseHeadersSanitized?: boolean;
   status: number;
 };
 
@@ -225,7 +252,13 @@ export function createProxyCache({
   // cdnProxyRouter.
   async function cdnProxyRouter(req: RequestI, res: ResponseI, coalesce = true): Promise<void> {
     let targetResponse = res;
-    const originUrl = decodeProxyPath(req.path, req.query);
+    const decodedOriginUrl = decodeProxyPath(req.path, req.query);
+    const originUrl = canonicalHttpUrl(decodedOriginUrl) ?? '';
+    if (!originUrl) {
+      targetResponse.status(400);
+      targetResponse.send(`Invalid proxy URL: ${decodedOriginUrl}`);
+      return;
+    }
     if (!shouldProxyPath(originUrl)) {
       targetResponse.status(403);
       targetResponse.send(`Refusing to proxy URL: ${originUrl}`);
@@ -248,13 +281,16 @@ export function createProxyCache({
     });
     let cacheObject = await cacache.get.info(cachePath, cacheKey);
 
-    targetResponse.setHeader('x-cdn-proxy-origin-url', originUrl);
+    targetResponse.setHeader(HTTP_RESPONSE_HEADER_ORIGIN_URL, originUrl);
 
     let servingStale = false;
     let staleResponseCompletion: Promise<void> | undefined;
     if (cacheObject && !req.query.reload) {
       const metadata = cacheObject.metadata as CacheMetadata;
-      if (metadata.cssTransformed && metadata.cssTransformFingerprint !== cssTransformFingerprint) {
+      if (
+        metadata.responseHeadersSanitized !== true ||
+        (metadata.cssTransformed && metadata.cssTransformFingerprint !== cssTransformFingerprint)
+      ) {
         await cacache.rm.entry(cachePath, cacheKey);
         cacheObject = null;
       } else {
@@ -349,9 +385,10 @@ export function createProxyCache({
         responseStarted = true;
         const contentType = originResponse.headers.get('content-type') ?? undefined;
         const contentEncoding = originResponse.headers.get('content-encoding') ?? undefined;
+        const connectionHeaders = connectionHeaderNames(originResponse.headers);
         const responseHeaders = Object.fromEntries(
           Array.from(originResponse.headers.entries())
-            .filter(([key]) => !uncacheableResponseHeaders.includes(key))
+            .filter(([key]) => !uncacheableResponseHeaders.has(key) && !connectionHeaders.has(key))
             .map(([key, value]) => [key, key === 'location' ? resolveLocation(originUrl, value) : value])
         );
 
@@ -383,9 +420,10 @@ export function createProxyCache({
         targetResponse.status(originResponse.status);
         targetResponse.setHeader(HTTP_RESPONSE_HEADER_CACHE_STATUS, 'MISS');
         originResponse.headers.forEach((value, key) => {
+          if (unrelayedResponseHeaders.has(key) || connectionHeaders.has(key)) return;
           if (key === 'content-length' && contentType?.startsWith('text/css')) return;
           const outputValue = key === 'location' ? proxyLocation(value) : value;
-          targetResponse.setHeader(key, outputValue);
+          targetResponse.setHeader(key === 'server' ? 'origin-server' : key, outputValue);
         });
 
         const redirected = isRedirectStatus(originResponse.status) && originResponse.headers.has('location');
@@ -422,6 +460,7 @@ export function createProxyCache({
           originUrl,
           headers: responseHeaders,
           initialAgeSeconds: parseAgeSeconds(responseHeaders.age),
+          responseHeadersSanitized: true,
           status: originResponse.status,
         } satisfies CacheMetadata;
         const cacheWriteStream = createCacheWriteStream(cachePath, cacheKey, cacheMetadata);
@@ -462,7 +501,8 @@ export function createProxyCache({
 
       function proxyLocation(value: string): string {
         const resolved = resolveLocation(originUrl, value);
-        return shouldProxyPath(resolved) ? encodeProxyPath(resolved) : resolved;
+        const allowedUrl = proxyableHttpUrl(resolved);
+        return allowedUrl ? encodeProxyPath(allowedUrl) : resolved;
       }
     }
 
@@ -475,8 +515,9 @@ export function createProxyCache({
       const metadata = entry.metadata as CacheMetadata;
       response.setHeader(HTTP_RESPONSE_HEADER_CACHE_STATUS, 'HIT');
       for (const [key, originalValue] of Object.entries(metadata.headers)) {
-        const value =
-          key === 'location' && shouldProxyPath(originalValue) ? encodeProxyPath(originalValue) : originalValue;
+        if (uncacheableResponseHeaders.has(key)) continue;
+        const allowedLocation = key === 'location' ? proxyableHttpUrl(originalValue) : undefined;
+        const value = allowedLocation ? encodeProxyPath(allowedLocation) : originalValue;
         response.setHeader(key === 'server' ? 'origin-server' : key, value);
       }
       response.setHeader('age', Math.floor(ageMs / 1000));
@@ -763,17 +804,19 @@ export function createProxyCache({
 
     // rewrite script[src]
     for (const element of htmlRoot.querySelectorAll('script[src]')) {
-      if (shouldProxyPath(element.attributes.src)) {
+      const allowedUrl = proxyableHttpUrl(element.attributes.src);
+      if (allowedUrl) {
         modified = true;
-        element.setAttribute('src', encodeProxyPath(element.attributes.src));
+        element.setAttribute('src', encodeProxyPath(allowedUrl));
       }
     }
 
     // rewrite link[href]
     for (const element of htmlRoot.querySelectorAll('link[rel=stylesheet][href]')) {
-      if (shouldProxyPath(element.attributes.href)) {
+      const allowedUrl = proxyableHttpUrl(element.attributes.href);
+      if (allowedUrl) {
         modified = true;
-        element.setAttribute('href', encodeProxyPath(element.attributes.href));
+        element.setAttribute('href', encodeProxyPath(allowedUrl));
       }
     }
 
@@ -790,8 +833,13 @@ export function createProxyCache({
   }
 
   function transformCssUrl(value: string): string | undefined {
-    if (value.startsWith('data:') || !shouldProxyPath(value)) return undefined;
-    return encodeProxyPath(value);
+    const allowedUrl = proxyableHttpUrl(value);
+    return allowedUrl ? encodeProxyPath(allowedUrl) : undefined;
+  }
+
+  function proxyableHttpUrl(value: string): string | undefined {
+    const canonicalUrl = canonicalHttpUrl(value);
+    return canonicalUrl && shouldProxyPath(canonicalUrl) ? canonicalUrl : undefined;
   }
 }
 
@@ -1027,6 +1075,36 @@ function normalizeAcceptEncoding(value: string | string[] | undefined): string |
 
 function headerValue(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value.join(',') : value;
+}
+
+function canonicalHttpUrl(value: string): string | undefined {
+  if ([...value].some((character) => character.charCodeAt(0) <= 31 || character.charCodeAt(0) === 127)) {
+    return undefined;
+  }
+  try {
+    const url = new URL(value);
+    if (
+      (url.protocol !== 'http:' && url.protocol !== 'https:') ||
+      !url.hostname ||
+      url.username !== '' ||
+      url.password !== ''
+    ) {
+      return undefined;
+    }
+    return url.toString();
+  } catch (error) {
+    if (error instanceof TypeError) return undefined;
+    throw error;
+  }
+}
+
+function connectionHeaderNames(headers: Headers): Set<string> {
+  return new Set(
+    (headers.get('connection') ?? '')
+      .split(',')
+      .map((name) => name.trim().toLowerCase())
+      .filter(Boolean)
+  );
 }
 
 function isRedirectStatus(status: number): boolean {

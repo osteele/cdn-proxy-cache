@@ -40,6 +40,8 @@
     "mutation:dry": "stryker run --dryRunOnly",
     "mutation:stream": "stryker run stryker.stream.config.mjs",
     "mutation:stream:dry": "stryker run stryker.stream.config.mjs --dryRunOnly",
+    "mutation:security": "stryker run stryker.security.config.mjs",
+    "mutation:security:dry": "stryker run stryker.security.config.mjs --dryRunOnly",
     "format": "biome format --write src tests",
     "format-check": "biome ci src tests",
     "fix": "biome check --write src tests",

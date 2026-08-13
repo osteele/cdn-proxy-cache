@@ -26,10 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Included the origin's `Age` value in freshness and revalidation decisions.
 - Cached successful zero-length responses instead of repeatedly fetching them after `cacache` rejected an empty stream.
 - Treated only complete proxy-prefix path segments as proxy paths and preserved matching text inside origin pathnames.
+- Rejected malformed proxy targets before allowlist evaluation, network access, or diagnostic-header construction.
+- Prevented origins and legacy cache entries from spoofing proxy diagnostics, setting cookies on the proxy origin, or replaying cached cookies.
+- Removed fixed and `Connection`-nominated hop-by-hop fields plus origin-wide state headers from relayed and cached responses.
 
 ### Testing
 
-- Added Allium contracts, generated codec/lifecycle contract tests, a cache reference model, and a bounded StrykerJS mutation baseline that runs through Bun.
+- Added Allium contracts, generated codec/lifecycle contract tests, a cache reference model, adversarial trust-boundary tests, and bounded StrykerJS mutation slices that run through Bun.
 
 ### Performance
 
