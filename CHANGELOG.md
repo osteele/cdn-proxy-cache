@@ -30,11 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rejected malformed proxy targets before allowlist evaluation, network access, or diagnostic-header construction.
 - Prevented origins and legacy cache entries from spoofing proxy diagnostics, setting cookies on the proxy origin, or replaying cached cookies.
 - Removed fixed and `Connection`-nominated hop-by-hop fields plus origin-wide state headers from relayed and cached responses.
+- Isolated coalesced waiter cancellation and client disconnects so they finish promptly without canceling another caller's origin transfer.
+- Coalesced concurrent forced reloads after a successful shared transfer and retried them when the shared generation was canceled or failed.
+- Preserved timeout and client-disconnect reasons in proxy diagnostics instead of replacing them with a generic fetch-abort error.
 
 ### Testing
 
 - Added Allium contracts, generated codec/lifecycle contract tests, a cache reference model, adversarial trust-boundary tests, and bounded StrykerJS mutation slices that run through Bun.
 - Replaced the import-only compatibility check with installed-tarball tests that exercise CommonJS and ES module imports, public declarations, packaged templates, and real cache misses and hits across supported Node.js and Express versions.
+- Added shared-generation cancellation contracts, deterministic owner/follower schedules, and a focused mutation campaign for cleanup and retry behavior.
 
 ### Performance
 

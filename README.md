@@ -102,6 +102,10 @@ try {
 }
 ```
 
+Cancellation is scoped to the warming operation that receives the signal. If it is waiting for
+origin work owned by another caller, that shared transfer continues. If it owns a transfer that
+another caller is waiting for, the waiter retries after the canceled or failed generation finishes.
+
 ## API
 
 ### `createProxyCache(options)`

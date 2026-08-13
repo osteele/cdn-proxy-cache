@@ -51,6 +51,14 @@ mutation-security-dry:
 mutation-security:
     bun run mutation:security
 
+# Verify the concurrency/cancellation mutation setup without executing mutants
+mutation-concurrency-dry:
+    bun run mutation:concurrency:dry
+
+# Run mutation testing for shared-work cancellation and cleanup
+mutation-concurrency:
+    bun run mutation:concurrency
+
 # Type check
 typecheck:
     bun run typecheck

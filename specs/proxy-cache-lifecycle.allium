@@ -3,8 +3,8 @@
 --
 -- Scope: Observable lifecycle of one canonical cache key.
 -- Includes: Empty/fresh/stale states, storage eligibility, reload, revalidation,
--- zero-length representations, invalidation, selector isolation, and request
--- coalescing.
+-- zero-length representations, invalidation, selector isolation, request
+-- coalescing, and cancellation ownership.
 -- Excludes: cacache layout, stream plumbing, timers, byte transforms, warming,
 -- and the exact HTTP freshness calculation.
 --
@@ -63,6 +63,21 @@ contract ProxyCacheLifecycle {
     @invariant CoalescedOriginTransfer
         -- Concurrent requests for the same canonical key cause at most one
         -- origin transfer for the same cold miss or refresh generation.
+
+    @invariant CoalescedWaiterCancellationIsolation
+        -- Canceling or disconnecting a waiter that does not own the shared
+        -- origin transfer promptly ends only that wait. The active generation
+        -- and its other waiters continue unaffected.
+
+    @invariant CanceledGenerationRecovery
+        -- Canceling the waiter that owns an active generation may cancel that
+        -- generation. Other non-canceled waiters can retry in one later
+        -- generation, and no partial representation becomes reusable.
+
+    @invariant FailedGenerationRecovery
+        -- A failed generation is not treated as a reusable representation.
+        -- A non-canceled waiter can retry while successful generations remain
+        -- coalesced into one origin transfer.
 }
 
 ------------------------------------------------------------

@@ -175,6 +175,7 @@ const headerAcceptList = ['accept', 'accept-language', 'accept-encoding'];
 
 /** The express.Request properties that cdnProxyRouter depends on. */
 export interface RequestI {
+  readonly aborted?: boolean;
   headers: IncomingHttpHeaders;
   path: string;
   query: Record<string, unknown>;
@@ -185,6 +186,7 @@ export interface RequestI {
 
 /** The express.Response properties that cdnProxyRouter depends on. */
 export interface ResponseI extends NodeJS.WritableStream {
+  readonly destroyed?: boolean;
   readonly writableFinished?: boolean;
   destroy(error?: Error): void;
   setHeader(key: string, value: string | number | readonly string[]): void;
@@ -230,7 +232,7 @@ export function createProxyCache({
   requirePositiveInteger('maxCssTransformBytes', maxCssTransformBytes);
   requirePositiveInteger('requestTimeoutMs', requestTimeoutMs);
   requirePositiveInteger('warmConcurrency', warmConcurrency);
-  const inFlightRequests = new Map<string, Promise<void>>();
+  const inFlightRequests = new Map<string, Promise<boolean>>();
   const cssTransformFingerprint = JSON.stringify({
     schema: 1,
     proxyPrefix,
@@ -257,7 +259,9 @@ export function createProxyCache({
   //
   // This function uses the more general type to allow prefetch to call
   // cdnProxyRouter.
-  async function cdnProxyRouter(req: RequestI, res: ResponseI, coalesce = true): Promise<void> {
+  async function cdnProxyRouter(req: RequestI, res: ResponseI): Promise<void> {
+    if (req.signal?.aborted) throw abortReason(req.signal);
+    if (req.aborted || res.destroyed) return;
     let targetResponse = res;
     const decodedOriginUrl = decodeProxyPath(req.path, req.query);
     const originUrl = canonicalHttpUrl(decodedOriginUrl) ?? '';
@@ -287,6 +291,8 @@ export function createProxyCache({
       acceptEncoding,
     });
     let cacheObject = await cacache.get.info(cachePath, cacheKey);
+    if (req.signal?.aborted) throw abortReason(req.signal);
+    if (req.aborted || res.destroyed) return;
 
     targetResponse.setHeader(HTTP_RESPONSE_HEADER_ORIGIN_URL, originUrl);
 
@@ -333,32 +339,41 @@ export function createProxyCache({
     debug('cache miss', originUrl);
     onEvent?.({ type: 'cache-miss', url: originUrl });
 
-    if (coalesce) {
-      const existingRequest = inFlightRequests.get(cacheKey);
-      if (existingRequest) {
-        if (servingStale) {
-          await staleResponseCompletion;
+    const existingRequest = inFlightRequests.get(cacheKey);
+    if (existingRequest) {
+      if (servingStale) {
+        await staleResponseCompletion;
+        return;
+      }
+      const waiterAbortContext = createAbortContext(req, res);
+      try {
+        const outcome = await Promise.race([
+          existingRequest.then(
+            (reusable) => (reusable ? ('reusable' as const) : ('failed' as const)),
+            () => 'failed' as const
+          ),
+          waiterAbortContext.aborted.then(() => 'aborted' as const),
+        ]);
+        if (outcome === 'aborted') {
+          if (req.signal?.aborted) throw abortReason(req.signal);
           return;
         }
-        await existingRequest.catch(() => undefined);
-        return cdnProxyRouter(req, res, false);
-      }
-
-      const request = fetchOrigin();
-      inFlightRequests.set(cacheKey, request);
-      try {
-        await request;
-        await staleResponseCompletion;
+        return cdnProxyRouter(outcome === 'reusable' ? requestWithoutReload(req) : req, res);
       } finally {
-        if (inFlightRequests.get(cacheKey) === request) inFlightRequests.delete(cacheKey);
+        waiterAbortContext.dispose();
       }
-      return;
     }
 
-    await fetchOrigin();
-    await staleResponseCompletion;
+    const request = fetchOrigin();
+    inFlightRequests.set(cacheKey, request);
+    try {
+      await request;
+      await staleResponseCompletion;
+    } finally {
+      if (inFlightRequests.get(cacheKey) === request) inFlightRequests.delete(cacheKey);
+    }
 
-    async function fetchOrigin(): Promise<void> {
+    async function fetchOrigin(): Promise<boolean> {
       // Filter the headers, and combine string[] values back into strings.
       const reqHeaders: Record<string, string> = {};
       for (const key of headerAcceptList) {
@@ -421,7 +436,7 @@ export function createProxyCache({
               metadataInitialAgeSeconds(refreshedMetadata) * 1000
             );
           }
-          return;
+          return true;
         }
 
         targetResponse.status(originResponse.status);
@@ -437,7 +452,7 @@ export function createProxyCache({
         if (!originResponse.ok && !redirected) {
           debug(`Failed ${originResponse.ok} | ${originResponse.status} | ${originResponse.statusText}`);
           targetResponse.send(originResponse.statusText);
-          return;
+          return false;
         }
 
         const cachePolicy = parseCacheControl(responseHeaders['cache-control']);
@@ -456,7 +471,7 @@ export function createProxyCache({
           responseStream.on('error', (error) => targetResponse.destroy(error));
           responseStream.pipe(targetResponse);
           await settleStreamOperations([waitForReadable(responseStream), waitForWritable(targetResponse)]);
-          return;
+          return false;
         }
 
         const cssTransformed =
@@ -489,19 +504,23 @@ export function createProxyCache({
         const bytes = await cacheCommitted;
         debug('wrote', bytes, 'bytes to cache for', originUrl);
         onEvent?.({ type: 'cache-write', url: originUrl, bytes });
+        return true;
       } catch (cause) {
         if (req.signal?.aborted) throw abortReason(req.signal);
-        const error = toError(cause);
+        const error = abortContext.controller.signal.aborted
+          ? abortReason(abortContext.controller.signal)
+          : toError(cause);
         onEvent?.({ type: 'error', url: originUrl, phase: responseStarted ? 'stream' : 'fetch', error });
         debug('origin request failed', originUrl, error);
-        if (servingStale) return;
+        if (servingStale) return false;
         if (responseStarted || abortContext.clientAborted) {
           targetResponse.destroy(error);
-          return;
+          return false;
         }
         const status = abortContext.timedOut ? 504 : 502;
         targetResponse.status(status);
         targetResponse.send(`Error during request for ${originUrl}:\n${error.message}`);
+        return false;
       } finally {
         abortContext.dispose();
       }
@@ -977,26 +996,36 @@ function createCacheWriteStream(cachePath: string, cacheKey: string, metadata: C
   return writer;
 }
 
-function createAbortContext(req: RequestI, res: ResponseI | undefined, timeoutMs: number) {
+function createAbortContext(req: RequestI, res: ResponseI | undefined, timeoutMs?: number) {
   const controller = new AbortController();
   let clientAborted = false;
   let timedOut = false;
+  let resolveAborted = () => {};
+  const aborted = new Promise<void>((resolve) => {
+    resolveAborted = resolve;
+  });
+  controller.signal.addEventListener('abort', resolveAborted, { once: true });
   const abortFromSignal = () => controller.abort(abortReason(req.signal!));
   const abortFromClient = () => {
     if (res?.writableFinished) return;
     clientAborted = true;
     controller.abort(new Error('Client disconnected'));
   };
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    controller.abort(new Error(`Origin request timed out after ${timeoutMs}ms`));
-  }, timeoutMs);
+  const timeout =
+    timeoutMs === undefined
+      ? undefined
+      : setTimeout(() => {
+          timedOut = true;
+          controller.abort(new Error(`Origin request timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
   req.signal?.addEventListener('abort', abortFromSignal, { once: true });
   req.once?.('aborted', abortFromClient);
   res?.once('close', abortFromClient);
   if (req.signal?.aborted) abortFromSignal();
+  else if (req.aborted || res?.destroyed) abortFromClient();
 
   return {
+    aborted,
     controller,
     get clientAborted() {
       return clientAborted;
@@ -1006,6 +1035,7 @@ function createAbortContext(req: RequestI, res: ResponseI | undefined, timeoutMs
     },
     dispose() {
       clearTimeout(timeout);
+      controller.signal.removeEventListener('abort', resolveAborted);
       req.signal?.removeEventListener('abort', abortFromSignal);
       req.off?.('aborted', abortFromClient);
       res?.off('close', abortFromClient);
@@ -1015,6 +1045,20 @@ function createAbortContext(req: RequestI, res: ResponseI | undefined, timeoutMs
 
 function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error('Operation aborted');
+}
+
+function requestWithoutReload(req: RequestI): RequestI {
+  const query = { ...req.query };
+  delete query.reload;
+  return {
+    aborted: req.aborted,
+    headers: req.headers,
+    off: req.off?.bind(req),
+    once: req.once?.bind(req),
+    path: req.path,
+    query,
+    signal: req.signal,
+  };
 }
 
 function toError(value: unknown): Error {

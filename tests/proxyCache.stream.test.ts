@@ -183,6 +183,657 @@ describe('stream fault boundaries', () => {
     }
   });
 
+  test('disconnects a coalesced follower without canceling the shared transfer', async () => {
+    let requests = 0;
+    let misses = 0;
+    const events: ProxyCacheEvent[] = [];
+    const originStarted = deferred();
+    const followerJoined = deferred();
+    const originRelease = deferred();
+    const server = http.createServer((_req, res) => {
+      requests++;
+      originStarted.resolve();
+      res.setHeader('cache-control', 'max-age=60');
+      void originRelease.promise.then(() => res.end('asset'));
+    });
+    const origin = await listen(server);
+    const cache = createLocalCache(origin, (event) => {
+      events.push(event);
+      if (event.type === 'cache-miss' && ++misses === 2) followerJoined.resolve();
+    });
+    const proxyPath = cache.encodeProxyPath(`${origin}/asset`);
+    const ownerResponse = new RecordingResponse();
+    const followerResponse = new RecordingResponse();
+    const followerRequest = makeRequest(proxyPath);
+    let owner: Promise<void> | undefined;
+    let follower: Promise<void> | undefined;
+
+    try {
+      owner = cache.router(makeRequest(proxyPath), ownerResponse);
+      await originStarted.promise;
+      follower = cache.router(followerRequest, followerResponse);
+      await followerJoined.promise;
+      followerRequest.emit('aborted');
+
+      await expect(withTimeout(follower, 100)).resolves.toBeUndefined();
+      expect(requests).toBe(1);
+      expect(followerResponse.body).toHaveLength(0);
+      expect(followerRequest.listenerCount('aborted')).toBe(0);
+      expect(followerResponse.listenerCount('close')).toBe(0);
+      expect(events.some((event) => event.type === 'error')).toBe(false);
+
+      originRelease.resolve();
+      await expect(owner).resolves.toBeUndefined();
+      expect(ownerResponse.body.toString()).toBe('asset');
+      expect(Object.keys(await cache.ls())).toHaveLength(1);
+    } finally {
+      originRelease.resolve();
+      await Promise.allSettled([owner, follower].filter((promise) => promise !== undefined));
+      await cache.clear();
+      await close(server);
+    }
+  });
+
+  test('observes a follower disconnect that happens before it joins shared work', async () => {
+    let requests = 0;
+    const originStarted = deferred();
+    const originRelease = deferred();
+    const server = http.createServer((_req, res) => {
+      requests++;
+      originStarted.resolve();
+      res.setHeader('cache-control', 'max-age=60');
+      void originRelease.promise.then(() => res.end('asset'));
+    });
+    const origin = await listen(server);
+    const cache = createLocalCache(origin);
+    const proxyPath = cache.encodeProxyPath(`${origin}/asset`);
+    const ownerResponse = new RecordingResponse();
+    const followerResponse = new RecordingResponse();
+    followerResponse.destroy();
+    let owner: Promise<void> | undefined;
+    let follower: Promise<void> | undefined;
+
+    try {
+      owner = cache.router(makeRequest(proxyPath), ownerResponse);
+      await originStarted.promise;
+      follower = cache.router(makeRequest(proxyPath), followerResponse);
+
+      await expect(withTimeout(follower, 100)).resolves.toBeUndefined();
+      expect(requests).toBe(1);
+
+      originRelease.resolve();
+      await expect(owner).resolves.toBeUndefined();
+      expect(ownerResponse.body.toString()).toBe('asset');
+    } finally {
+      originRelease.resolve();
+      await Promise.allSettled([owner, follower].filter((promise) => promise !== undefined));
+      await cache.clear();
+      await close(server);
+    }
+  });
+
+  test('rejects a pre-aborted coalesced follower without waiting for shared work', async () => {
+    let requests = 0;
+    const originStarted = deferred();
+    const originRelease = deferred();
+    const server = http.createServer((_req, res) => {
+      requests++;
+      originStarted.resolve();
+      res.setHeader('cache-control', 'max-age=60');
+      void originRelease.promise.then(() => res.end('asset'));
+    });
+    const origin = await listen(server);
+    const cache = createLocalCache(origin);
+    const proxyPath = cache.encodeProxyPath(`${origin}/asset`);
+    const ownerResponse = new RecordingResponse();
+    const controller = new AbortController();
+    controller.abort(new Error('already canceled'));
+    let owner: Promise<void> | undefined;
+
+    try {
+      owner = cache.router(makeRequest(proxyPath), ownerResponse);
+      await originStarted.promise;
+      const follower = cache.router({ ...makeRequest(proxyPath), signal: controller.signal }, new RecordingResponse());
+
+      await expect(withTimeout(follower, 100)).rejects.toThrow('already canceled');
+      expect(requests).toBe(1);
+
+      originRelease.resolve();
+      await expect(owner).resolves.toBeUndefined();
+    } finally {
+      originRelease.resolve();
+      await Promise.allSettled([owner].filter((promise) => promise !== undefined));
+      await cache.clear();
+      await close(server);
+    }
+  });
+
+  test('rejects a pre-aborted generation owner before origin work', async () => {
+    const controller = new AbortController();
+    controller.abort(new Error('already canceled owner'));
+    const cache = createLocalCache('http://127.0.0.1');
+
+    try {
+      await expect(
+        cache.router(
+          { ...makeRequest(cache.encodeProxyPath('http://127.0.0.1/asset')), signal: controller.signal },
+          new RecordingResponse()
+        )
+      ).rejects.toThrow('already canceled owner');
+      expect(Object.keys(await cache.ls())).toHaveLength(0);
+    } finally {
+      await cache.clear();
+    }
+  });
+
+  test('does not serve a cached body to a pre-aborted signal', async () => {
+    let requests = 0;
+    const server = http.createServer((_req, res) => {
+      requests++;
+      res.setHeader('cache-control', 'max-age=60');
+      res.end('asset');
+    });
+    const origin = await listen(server);
+    const cache = createLocalCache(origin);
+    const controller = new AbortController();
+    const response = new RecordingResponse();
+
+    try {
+      await requestCache(cache, `${origin}/asset`);
+      controller.abort(new Error('already canceled cache hit'));
+
+      await expect(
+        cache.router(
+          {
+            ...makeRequest(cache.encodeProxyPath(`${origin}/asset`)),
+            signal: controller.signal,
+          },
+          response
+        )
+      ).rejects.toThrow('already canceled cache hit');
+      expect(response.body).toHaveLength(0);
+      expect(requests).toBe(1);
+    } finally {
+      await cache.clear();
+      await close(server);
+    }
+  });
+
+  test('observes a signal canceled after router entry but before origin setup', async () => {
+    let requests = 0;
+    const server = http.createServer((_req, res) => {
+      requests++;
+      res.setHeader('cache-control', 'max-age=60');
+      res.end('unexpected');
+    });
+    const origin = await listen(server);
+    const controller = new AbortController();
+    let cancelDuringLookup = false;
+    const cache = createLocalCache(origin, (event) => {
+      if (cancelDuringLookup && event.type === 'request') controller.abort(new Error('canceled during lookup'));
+    });
+    const response = new RecordingResponse();
+
+    try {
+      await requestCache(cache, `${origin}/asset`);
+      cancelDuringLookup = true;
+      await expect(
+        cache.router(
+          {
+            ...makeRequest(cache.encodeProxyPath(`${origin}/asset`)),
+            signal: controller.signal,
+          },
+          response
+        )
+      ).rejects.toThrow('canceled during lookup');
+      expect(response.body).toHaveLength(0);
+      expect(requests).toBe(1);
+    } finally {
+      await cache.clear();
+      await close(server);
+    }
+  });
+
+  test('observes a response closed after router entry but before a cache hit', async () => {
+    let requests = 0;
+    const server = http.createServer((_req, res) => {
+      requests++;
+      res.setHeader('cache-control', 'max-age=60');
+      res.end('asset');
+    });
+    const origin = await listen(server);
+    let closeDuringLookup = false;
+    const response = new RecordingResponse();
+    const cache = createLocalCache(origin, (event) => {
+      if (closeDuringLookup && event.type === 'request') response.destroy();
+    });
+
+    try {
+      await requestCache(cache, `${origin}/asset`);
+      closeDuringLookup = true;
+
+      await expect(
+        withTimeout(cache.router(makeRequest(cache.encodeProxyPath(`${origin}/asset`)), response), 100)
+      ).resolves.toBeUndefined();
+      expect(response.body).toHaveLength(0);
+      expect(requests).toBe(1);
+    } finally {
+      await cache.clear();
+      await close(server);
+    }
+  });
+
+  test('does not serve a cached body to an already disconnected request', async () => {
+    let requests = 0;
+    const server = http.createServer((_req, res) => {
+      requests++;
+      res.setHeader('cache-control', 'max-age=60');
+      res.end('asset');
+    });
+    const origin = await listen(server);
+    const cache = createLocalCache(origin);
+    const proxyPath = cache.encodeProxyPath(`${origin}/asset`);
+    const disconnected = makeRequest(proxyPath);
+    disconnected.aborted = true;
+    const response = new RecordingResponse();
+
+    try {
+      await requestCache(cache, `${origin}/asset`);
+      await cache.router(disconnected, response);
+
+      expect(response.body).toHaveLength(0);
+      expect(requests).toBe(1);
+    } finally {
+      await cache.clear();
+      await close(server);
+    }
+  });
+
+  test('does not serve a cached body to an already destroyed response', async () => {
+    let requests = 0;
+    const server = http.createServer((_req, res) => {
+      requests++;
+      res.setHeader('cache-control', 'max-age=60');
+      res.end('asset');
+    });
+    const origin = await listen(server);
+    const cache = createLocalCache(origin);
+    const response = new RecordingResponse();
+    response.destroy();
+
+    try {
+      await requestCache(cache, `${origin}/asset`);
+      await cache.router(makeRequest(cache.encodeProxyPath(`${origin}/asset`)), response);
+
+      expect(response.body).toHaveLength(0);
+      expect(requests).toBe(1);
+    } finally {
+      await cache.clear();
+      await close(server);
+    }
+  });
+
+  test('disconnects a coalesced follower when its response closes', async () => {
+    let requests = 0;
+    const originStarted = deferred();
+    const originRelease = deferred();
+    const server = http.createServer((_req, res) => {
+      requests++;
+      originStarted.resolve();
+      res.setHeader('cache-control', 'max-age=60');
+      void originRelease.promise.then(() => res.end('asset'));
+    });
+    const origin = await listen(server);
+    const cache = createLocalCache(origin);
+    const proxyPath = cache.encodeProxyPath(`${origin}/asset`);
+    const ownerResponse = new RecordingResponse();
+    const followerResponse = new RecordingResponse();
+    let owner: Promise<void> | undefined;
+    let follower: Promise<void> | undefined;
+
+    try {
+      owner = cache.router(makeRequest(proxyPath), ownerResponse);
+      await originStarted.promise;
+      follower = cache.router(makeRequest(proxyPath), followerResponse);
+      followerResponse.destroy();
+
+      await expect(withTimeout(follower, 100)).resolves.toBeUndefined();
+      expect(requests).toBe(1);
+
+      originRelease.resolve();
+      await expect(owner).resolves.toBeUndefined();
+    } finally {
+      originRelease.resolve();
+      await Promise.allSettled([owner, follower].filter((promise) => promise !== undefined));
+      await cache.clear();
+      await close(server);
+    }
+  });
+
+  test('removes cancellation listeners after a coalesced follower completes', async () => {
+    const originStarted = deferred();
+    const originRelease = deferred();
+    const server = http.createServer((_req, res) => {
+      originStarted.resolve();
+      res.setHeader('cache-control', 'max-age=60');
+      void originRelease.promise.then(() => res.end('asset'));
+    });
+    const origin = await listen(server);
+    const cache = createLocalCache(origin);
+    const proxyPath = cache.encodeProxyPath(`${origin}/asset`);
+    const ownerResponse = new RecordingResponse();
+    const followerRequest = makeRequest(proxyPath);
+    const followerResponse = new RecordingResponse();
+    const controller = new AbortController();
+    const removeSignalListener = spyOn(controller.signal, 'removeEventListener');
+    followerRequest.signal = controller.signal;
+    let owner: Promise<void> | undefined;
+    let follower: Promise<void> | undefined;
+
+    try {
+      owner = cache.router(makeRequest(proxyPath), ownerResponse);
+      await originStarted.promise;
+      follower = cache.router(followerRequest, followerResponse);
+      originRelease.resolve();
+      await Promise.all([owner, follower]);
+
+      expect(followerResponse.body.toString()).toBe('asset');
+      expect(followerRequest.listenerCount('aborted')).toBe(0);
+      expect(followerResponse.listenerCount('close')).toBe(0);
+      expect(removeSignalListener).toHaveBeenCalledWith('abort', expect.any(Function));
+    } finally {
+      removeSignalListener.mockRestore();
+      originRelease.resolve();
+      await Promise.allSettled([owner, follower].filter((promise) => promise !== undefined));
+      await cache.clear();
+      await close(server);
+    }
+  });
+
+  test('does not write an error response after the generation owner disconnects before headers', async () => {
+    const originStarted = deferred();
+    const originClosed = deferred();
+    const server = http.createServer((req) => {
+      originStarted.resolve();
+      req.socket.once('close', originClosed.resolve);
+    });
+    const origin = await listen(server);
+    const events: ProxyCacheEvent[] = [];
+    const cache = createLocalCache(origin, (event) => events.push(event));
+    const request = makeRequest(cache.encodeProxyPath(`${origin}/slow`));
+    const response = new RecordingResponse();
+    let operation: Promise<void> | undefined;
+
+    try {
+      operation = cache.router(request, response);
+      await originStarted.promise;
+      request.aborted = true;
+      request.emit('aborted');
+
+      await expect(withTimeout(operation, 500)).resolves.toBeUndefined();
+      await expect(withTimeout(originClosed.promise, 500)).resolves.toBeUndefined();
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toHaveLength(0);
+      expect(events.find((event) => event.type === 'error')).toMatchObject({
+        type: 'error',
+        phase: 'fetch',
+        error: expect.objectContaining({ message: 'Client disconnected' }),
+      });
+    } finally {
+      request.emit('aborted');
+      await Promise.allSettled([operation].filter((promise) => promise !== undefined));
+      await cache.clear();
+      await close(server);
+    }
+  });
+
+  test('returns a timeout diagnostic when an origin stalls before headers', async () => {
+    const server = http.createServer(() => {});
+    const origin = await listen(server);
+    const cache = createLocalCache(origin, undefined, 25);
+
+    try {
+      const response = await requestCache(cache, `${origin}/slow`);
+
+      expect(response.statusCode).toBe(504);
+      expect(response.body.toString()).toContain('Origin request timed out after 25ms');
+    } finally {
+      await cache.clear();
+      await close(server);
+    }
+  });
+
+  test('returns a bad-gateway diagnostic for a non-timeout fetch failure', async () => {
+    const server = http.createServer();
+    const origin = await listen(server);
+    await close(server);
+    const cache = createLocalCache(origin, undefined, 250);
+
+    try {
+      const response = await requestCache(cache, `${origin}/unavailable`);
+
+      expect(response.statusCode).toBe(502);
+      expect(response.body.toString()).not.toContain('timed out');
+    } finally {
+      await cache.clear();
+    }
+  });
+
+  test('cancels a stale refresh when its client disconnects', async () => {
+    let requests = 0;
+    const refreshStarted = deferred();
+    const server = http.createServer((_req, res) => {
+      requests++;
+      if (requests === 1) {
+        res.setHeader('cache-control', 'max-age=0');
+        res.end('stale body');
+      } else {
+        refreshStarted.resolve();
+      }
+    });
+    const origin = await listen(server);
+    const cache = createLocalCache(origin);
+    const proxyPath = cache.encodeProxyPath(`${origin}/asset`);
+    const request = makeRequest(proxyPath);
+    const response = new RecordingResponse();
+    let refresh: Promise<void> | undefined;
+
+    try {
+      await requestCache(cache, `${origin}/asset`);
+      refresh = cache.router(request, response);
+      await refreshStarted.promise;
+      request.aborted = true;
+      request.emit('aborted');
+
+      await expect(withTimeout(refresh, 500)).resolves.toBeUndefined();
+      expect(response.body.toString()).toBe('stale body');
+      expect(request.listenerCount('aborted')).toBe(0);
+    } finally {
+      request.emit('aborted');
+      await Promise.allSettled([refresh].filter((promise) => promise !== undefined));
+      await cache.clear();
+      await close(server);
+    }
+  });
+
+  test('retries a forced follower after its shared cache write fails', async () => {
+    let requests = 0;
+    let misses = 0;
+    const cacheWriteStarted = deferred();
+    const failCacheWrite = deferred();
+    const followerJoined = deferred();
+    const server = http.createServer((_req, res) => {
+      requests++;
+      res.setHeader('cache-control', 'max-age=60');
+      res.end(requests < 3 ? 'version one' : 'version two');
+    });
+    const origin = await listen(server);
+    const cache = createLocalCache(origin, (event) => {
+      if (event.type === 'cache-miss' && ++misses === 3) {
+        failCacheWrite.resolve();
+        followerJoined.resolve();
+      }
+    });
+    const proxyPath = cache.encodeProxyPath(`${origin}/asset`);
+    const reloadRequest = () => ({ ...makeRequest(proxyPath), query: { reload: 'true' } });
+    const ownerResponse = new RecordingResponse();
+    const followerResponse = new RecordingResponse();
+    let putStream: ReturnType<typeof spyOn> | undefined;
+    let owner: Promise<void> | undefined;
+    let follower: Promise<void> | undefined;
+
+    try {
+      await requestCache(cache, `${origin}/asset`);
+      const failure = new Error('shared cache write failed');
+      putStream = spyOn(cacache.put, 'stream').mockImplementation(() => {
+        const writer = new stream.Writable({
+          write(_chunk, _encoding, callback) {
+            cacheWriteStarted.resolve();
+            void failCacheWrite.promise.then(() => callback(failure));
+          },
+        });
+        return writer as ReturnType<typeof cacache.put.stream>;
+      });
+      owner = cache.router(reloadRequest(), ownerResponse);
+      await cacheWriteStarted.promise;
+      follower = cache.router(reloadRequest(), followerResponse);
+      await followerJoined.promise;
+      putStream.mockRestore();
+
+      await expect(withTimeout(owner, 500)).resolves.toBeUndefined();
+      await expect(withTimeout(follower, 500)).resolves.toBeUndefined();
+      expect(ownerResponse.streamError?.message).toBe(failure.message);
+      expect(followerResponse.body.toString()).toBe('version two');
+      expect(requests).toBe(3);
+    } finally {
+      failCacheWrite.resolve();
+      putStream?.mockRestore();
+      await Promise.allSettled([owner, follower].filter((promise) => promise !== undefined));
+      await cache.clear();
+      await close(server);
+    }
+  });
+
+  test('retries a forced follower after its shared request times out before headers', async () => {
+    let requests = 0;
+    let misses = 0;
+    let fireOriginTimeout: (() => void) | undefined;
+    const stalledRequestStarted = deferred();
+    const followerJoined = deferred();
+    const server = http.createServer((_req, res) => {
+      requests++;
+      res.setHeader('cache-control', 'max-age=60');
+      if (requests === 1) {
+        res.end('version one');
+      } else if (requests === 2) {
+        stalledRequestStarted.resolve();
+      } else {
+        res.end('version two');
+      }
+    });
+    const origin = await listen(server);
+    const originalSetTimeout = globalThis.setTimeout;
+    const timeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation(((
+      callback: (...args: unknown[]) => void,
+      delay?: number,
+      ...args: unknown[]
+    ) => {
+      if (delay === 12_345) {
+        fireOriginTimeout = () => callback(...args);
+        return undefined as unknown as ReturnType<typeof setTimeout>;
+      }
+      return originalSetTimeout(callback, delay, ...args);
+    }) as typeof setTimeout);
+    const cache = createLocalCache(
+      origin,
+      (event) => {
+        if (event.type === 'cache-miss' && ++misses === 3) {
+          fireOriginTimeout!();
+          timeoutSpy.mockRestore();
+          followerJoined.resolve();
+        }
+      },
+      12_345
+    );
+    const proxyPath = cache.encodeProxyPath(`${origin}/asset`);
+    const reloadRequest = () => ({ ...makeRequest(proxyPath), query: { reload: 'true' } });
+    const ownerResponse = new RecordingResponse();
+    const followerResponse = new RecordingResponse();
+    let owner: Promise<void> | undefined;
+    let follower: Promise<void> | undefined;
+
+    try {
+      await requestCache(cache, `${origin}/asset`);
+      owner = cache.router(reloadRequest(), ownerResponse);
+      await stalledRequestStarted.promise;
+      follower = cache.router(reloadRequest(), followerResponse);
+      await followerJoined.promise;
+
+      await expect(withTimeout(owner, 500)).resolves.toBeUndefined();
+      await expect(withTimeout(follower, 500)).resolves.toBeUndefined();
+      expect(followerResponse.body.toString()).toBe('version two');
+      expect(requests).toBe(3);
+    } finally {
+      timeoutSpy.mockRestore();
+      await Promise.allSettled([owner, follower].filter((promise) => promise !== undefined));
+      await cache.clear();
+      await close(server);
+    }
+  });
+
+  test('retries a forced follower after its shared stale refresh is disconnected', async () => {
+    let requests = 0;
+    let misses = 0;
+    const refreshStarted = deferred();
+    const followerJoined = deferred();
+    const server = http.createServer((_req, res) => {
+      requests++;
+      if (requests === 1) {
+        res.setHeader('cache-control', 'max-age=0');
+        res.end('version one');
+      } else if (requests === 2) {
+        refreshStarted.resolve();
+      } else {
+        res.setHeader('cache-control', 'max-age=60');
+        res.end('version two');
+      }
+    });
+    const origin = await listen(server);
+    const staleRequest = makeRequest('');
+    const cache = createLocalCache(origin, (event) => {
+      if (event.type === 'cache-miss' && ++misses === 3) {
+        staleRequest.aborted = true;
+        staleRequest.emit('aborted');
+        followerJoined.resolve();
+      }
+    });
+    const proxyPath = cache.encodeProxyPath(`${origin}/asset`);
+    staleRequest.path = proxyPath;
+    const staleResponse = new RecordingResponse();
+    const followerResponse = new RecordingResponse();
+    let staleOwner: Promise<void> | undefined;
+    let forcedFollower: Promise<void> | undefined;
+
+    try {
+      await requestCache(cache, `${origin}/asset`);
+      staleOwner = cache.router(staleRequest, staleResponse);
+      await refreshStarted.promise;
+      forcedFollower = cache.router({ ...makeRequest(proxyPath), query: { reload: 'true' } }, followerResponse);
+      await followerJoined.promise;
+
+      await expect(withTimeout(staleOwner, 500)).resolves.toBeUndefined();
+      await expect(withTimeout(forcedFollower, 500)).resolves.toBeUndefined();
+      expect(staleResponse.body.toString()).toBe('version one');
+      expect(followerResponse.body.toString()).toBe('version two');
+      expect(requests).toBe(3);
+    } finally {
+      staleRequest.emit('aborted');
+      await Promise.allSettled([staleOwner, forcedFollower].filter((promise) => promise !== undefined));
+      await cache.clear();
+      await close(server);
+    }
+  });
+
   test('propagates a cache-writer failure without committing an entry', async () => {
     const server = http.createServer((_req, res) => {
       res.setHeader('cache-control', 'max-age=60');
@@ -344,8 +995,9 @@ function createLocalCache(origin: string, onEvent?: (event: ProxyCacheEvent) => 
   });
 }
 
-function makeRequest(proxyPath: string): RequestI {
+function makeRequest(proxyPath: string): RequestI & EventEmitter & { aborted: boolean } {
   return Object.assign(new EventEmitter(), {
+    aborted: false,
     headers: {},
     path: proxyPath,
     query: {},
@@ -388,4 +1040,12 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
