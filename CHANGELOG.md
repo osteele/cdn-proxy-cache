@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Removed a transitive `@types/cacache` requirement from the public declarations returned by `ProxyCache.ls()`.
 - Coalesced simultaneous misses and stale refreshes for the same cache key.
 - Revalidated cached responses with `ETag` and `Last-Modified` validators and reused cached bodies after `304 Not Modified` responses.
 - Restored backpressure progress for background stale refreshes, which could previously stall until the origin timeout.
@@ -33,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Testing
 
 - Added Allium contracts, generated codec/lifecycle contract tests, a cache reference model, adversarial trust-boundary tests, and bounded StrykerJS mutation slices that run through Bun.
+- Replaced the import-only compatibility check with installed-tarball tests that exercise CommonJS and ES module imports, public declarations, packaged templates, and real cache misses and hits across supported Node.js and Express versions.
 
 ### Performance
 

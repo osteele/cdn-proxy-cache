@@ -5,6 +5,7 @@ export {
   createProxyCache,
   HTTP_RESPONSE_HEADER_CACHE_STATUS,
   type ProxyCache,
+  type ProxyCacheEntry,
   type ProxyCacheEvent,
   type ProxyCacheOptions,
   type RequestI,

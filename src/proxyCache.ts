@@ -54,6 +54,16 @@ export type ProxyCacheEvent =
   | { type: 'cache-skip'; url: string; reason: 'no-store' | 'private' | 'vary-star' }
   | { type: 'error'; url: string; phase: 'fetch' | 'stream'; error: Error };
 
+/** A cache entry returned by {@link ProxyCache.ls}. */
+export type ProxyCacheEntry = {
+  integrity: string;
+  key: string;
+  metadata?: Record<string, unknown>;
+  path: string;
+  size: number;
+  time: number;
+};
+
 export type ProxyCache = {
   // properties
   cachePath: string;
@@ -67,7 +77,7 @@ export type ProxyCache = {
   // cache management methods
   clear: () => Promise<void>;
   warm: (options: WarmCacheOptions, callback?: (message: CacheWarmMessage) => void) => Promise<CacheWarmStats>;
-  ls: typeof cacacheLsBind;
+  ls: () => Promise<Record<string, ProxyCacheEntry>>;
 
   isProxyPath: (url: string) => boolean;
 
@@ -157,9 +167,6 @@ const uncacheableResponseHeaders = new Set([
 // are ignored, in order to assure that the cached response can be shared
 // between different requests.
 const headerAcceptList = ['accept', 'accept-language', 'accept-encoding'];
-
-// A dummy function used with typeof to derive the type of the bound method.
-const cacacheLsBind = () => cacache.ls('cachePath');
 
 // The RequestI and ReponseI interfaces specify the part of express.Request and
 // express.Response that cdnProxyRouter uses. It is done this way so that

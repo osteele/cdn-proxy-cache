@@ -494,7 +494,7 @@ describe('CDN Proxy', () => {
         expect(assetChecks).toBe(1);
         const entries = Object.values(await cache.ls());
         expect(entries).toHaveLength(1);
-        expect(entries[0].metadata.cssTransformed).toBe(true);
+        expect(entries[0].metadata?.cssTransformed).toBe(true);
         const stored = await cacache.get.byDigest(cache.cachePath, entries[0].integrity);
         expect(stored.toString()).toContain('/__proxy_cache/http/127.0.0.1');
       } finally {

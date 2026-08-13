@@ -14,6 +14,11 @@ check:
 build:
     bun run build
 
+# Smoke-test the packed artifact with an installed Express major
+compatibility-smoke express-version:
+    bun run build
+    sh scripts/test-packed-compatibility.sh {{quote(express-version)}}
+
 # Run tests
 test:
     bun test
