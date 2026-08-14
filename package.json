@@ -1,6 +1,6 @@
 {
   "name": "cdn-proxy-cache",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A caching proxy for CDN resources with URL rewriting, content transformation, and Express integration",
   "keywords": [
     "proxy",

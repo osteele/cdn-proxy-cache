@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-13
+
 ### Added
 
 - Added cache pruning with typed reclamation statistics and an optional unique-body byte bound with oldest-body eviction.
@@ -83,5 +85,6 @@ This is the first public release.
 - Returned cache-warming failures to callers instead of terminating the process.
 - Included runtime templates in the published package.
 
-[Unreleased]: https://github.com/osteele/cdn-proxy-cache/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/osteele/cdn-proxy-cache/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/osteele/cdn-proxy-cache/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/osteele/cdn-proxy-cache/releases/tag/v0.2.0
