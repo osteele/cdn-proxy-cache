@@ -1,0 +1,152 @@
+-- allium: 3
+-- proxy-cache-maintenance.allium
+--
+-- Scope: Observable same-process cache-wide maintenance and resource-bound
+-- lifecycle. Callers quiesce other processes before using these operations.
+-- Includes: operation quiescence, clear, prune, unique-body accounting,
+-- eviction, successful completion, and failure recovery.
+-- Excludes: cacache directory layout, checksum algorithm, and platform-specific
+-- filesystem error codes.
+--
+-- Authority: Public cache-management intent and the configured resource bound.
+-- Physical filesystem claims are verified by integration tests.
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract ProxyCacheMaintenance {
+    clear: () -> Boolean
+    prune: () -> Integer
+
+    @invariant ExclusiveMaintenance
+        -- Clear and prune begin only after operations that already hold the
+        -- same cache path in this process have settled. New same-process
+        -- operations wait until maintenance completes or fails.
+
+    @invariant CompleteClear
+        -- Successful clear leaves zero live entries and zero live cached body
+        -- bytes, without removing unrelated files.
+
+    @invariant PrunePreservesLiveEntries
+        -- Successful prune removes orphaned, missing, and corrupt state while
+        -- preserving every valid live entry and its body.
+
+    @invariant UniqueBodyAccounting
+        -- Multiple entries that reference the same content digest contribute
+        -- that body size only once to the configured byte bound.
+
+    @invariant BoundedStorage
+        -- After a successful mutating request settles, live unique cached body
+        -- bytes do not exceed the configured bound. An individually oversized
+        -- response may be delivered but does not remain reusable.
+
+    @invariant OldestBodyEviction
+        -- When eviction is required, unique bodies whose newest live reference
+        -- is oldest are removed first. All entries for an evicted digest are
+        -- removed together.
+
+    @invariant MaintenanceFailureTransparency
+        -- Failed maintenance reports failure, returns the store to available,
+        -- and never claims a successful clear or prune.
+}
+
+------------------------------------------------------------
+-- Entities and transitions
+------------------------------------------------------------
+
+entity CacheStore {
+    state: available | quiescing_clear | clearing | quiescing_prune | pruning | failed
+    active_operations: Integer
+    live_entry_count: Integer
+    live_body_bytes: Integer
+
+    transitions state {
+        available -> quiescing_clear
+        quiescing_clear -> clearing
+        clearing -> available
+        clearing -> failed
+        available -> quiescing_prune
+        quiescing_prune -> pruning
+        pruning -> available
+        pruning -> failed
+        failed -> available
+    }
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule RequestClear {
+    when: ClearRequested(store)
+    requires: store.state = available
+    ensures: store.state = quiescing_clear
+}
+
+rule BeginClear {
+    when: OperationsSettled(store)
+    requires: store.state = quiescing_clear
+    requires: store.active_operations = 0
+    ensures: store.state = clearing
+}
+
+rule CompleteClear {
+    when: ClearCompleted(store)
+    requires: store.state = clearing
+    ensures: store.live_entry_count = 0
+    ensures: store.live_body_bytes = 0
+    ensures: store.state = available
+}
+
+rule FailClear {
+    when: ClearFailed(store)
+    requires: store.state = clearing
+    ensures: store.state = failed
+}
+
+rule RequestPrune {
+    when: PruneRequested(store)
+    requires: store.state = available
+    ensures: store.state = quiescing_prune
+}
+
+rule BeginPrune {
+    when: OperationsSettled(store)
+    requires: store.state = quiescing_prune
+    requires: store.active_operations = 0
+    ensures: store.state = pruning
+}
+
+rule CompletePrune {
+    when: PruneCompleted(store, live_entry_count, live_body_bytes)
+    requires: store.state = pruning
+    requires: live_entry_count >= 0
+    requires: live_body_bytes >= 0
+    ensures: store.live_entry_count = live_entry_count
+    ensures: store.live_body_bytes = live_body_bytes
+    ensures: store.state = available
+}
+
+rule FailPrune {
+    when: PruneFailed(store)
+    requires: store.state = pruning
+    ensures: store.state = failed
+}
+
+rule RecoverMaintenance {
+    when: FailureReported(store)
+    requires: store.state = failed
+    ensures: store.state = available
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant ResourceCountsAreNonNegative {
+    for store in CacheStores:
+        store.active_operations >= 0 and
+        store.live_entry_count >= 0 and
+        store.live_body_bytes >= 0
+}

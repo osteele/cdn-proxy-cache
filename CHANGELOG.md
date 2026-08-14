@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added cache pruning with typed reclamation statistics and an optional unique-body byte bound with oldest-body eviction.
+
 ### Changed
 
 - Canonicalized `Accept` and `Accept-Encoding` cache-key values so equivalent requests share entries.
@@ -15,9 +19,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Made clear and prune exclusive with active same-process cache operations, including filesystem aliases, removed cache-owned temporary artifacts during clear, and rejected unsafe cache paths.
+- Removed a transitive `@types/cacache` requirement from the public declarations returned by `ProxyCache.ls()`.
 - Coalesced simultaneous misses and stale refreshes for the same cache key.
 - Revalidated cached responses with `ETag` and `Last-Modified` validators and reused cached bodies after `304 Not Modified` responses.
 - Restored backpressure progress for background stale refreshes, which could previously stall until the origin timeout.
+- Preserved percent-encoded origin query strings without double decoding.
+- Resolved and followed relative redirect locations through the proxy.
+- Reported body-stream and CSS transformation failures during cache warming.
+- Partitioned shared entries by `Accept-Language`, rejected `Vary: *`, and stopped forwarding browser user agents.
+- Invalidated transformed CSS when its proxy transformation configuration changes.
+- Included the origin's `Age` value in freshness and revalidation decisions.
+- Cached successful zero-length responses instead of repeatedly fetching them after `cacache` rejected an empty stream.
+- Treated only complete proxy-prefix path segments as proxy paths and preserved matching text inside origin pathnames.
+- Rejected malformed proxy targets before allowlist evaluation, network access, or diagnostic-header construction.
+- Prevented origins and legacy cache entries from spoofing proxy diagnostics, setting cookies on the proxy origin, or replaying cached cookies.
+- Removed fixed and `Connection`-nominated hop-by-hop fields plus origin-wide state headers from relayed and cached responses.
+- Isolated coalesced waiter cancellation and client disconnects so they finish promptly without canceling another caller's origin transfer.
+- Coalesced concurrent forced reloads after a successful shared transfer and retried them when the shared generation was canceled or failed.
+- Preserved timeout and client-disconnect reasons in proxy diagnostics instead of replacing them with a generic fetch-abort error.
+
+### Testing
+
+- Added Allium contracts, generated codec/lifecycle contract tests, a cache reference model, adversarial trust-boundary tests, and bounded StrykerJS mutation slices that run through Bun.
+- Added mixed-process tests for Bun-to-Node warm visibility, warm-to-serve reuse, overlapping cold writes, and recovery after a writer is terminated before commit.
+- Replaced the import-only compatibility check with installed-tarball tests that exercise CommonJS and ES module imports, public declarations, packaged templates, and real cache misses and hits across supported Node.js and Express versions.
+- Added shared-generation cancellation contracts, deterministic owner/follower schedules, and a focused mutation campaign for cleanup and retry behavior.
 
 ### Performance
 

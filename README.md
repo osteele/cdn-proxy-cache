@@ -73,6 +73,7 @@ app.listen(3000);
 ```
 
 `shouldProxyPath` is the proxy allowlist. Rewriting methods leave rejected URLs unchanged. Requests that address a rejected URL through `cache.router` receive HTTP 403.
+Malformed, credential-bearing, or non-HTTP proxy targets receive HTTP 400 before the allowlist or network is consulted. The router and rewriting methods pass only canonical HTTP(S) URLs without embedded credentials to `shouldProxyPath`.
 
 ## Cache warming
 
@@ -101,6 +102,10 @@ try {
 }
 ```
 
+Cancellation is scoped to the warming operation that receives the signal. If it is waiting for
+origin work owned by another caller, that shared transfer continues. If it owns a transfer that
+another caller is waiting for, the waiter retries after the canceled or failed generation finishes.
+
 ## API
 
 ### `createProxyCache(options)`
@@ -110,15 +115,19 @@ Creates a `ProxyCache` instance.
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `proxyPrefix` | `string` | required | URL prefix mounted on the Express application. |
-| `cachePath` | `string` | required | Directory used for cached content and metadata. |
+| `cachePath` | `string` | required | Directory used for cached content and metadata; resolved to its canonical physical path at construction. |
 | `cacheSeeds` | `string[]` | required | Starting URLs for `cache.warm()`. Use an empty array when warming is not needed. |
 | `shouldProxyPath` | `(url: string) => boolean` | required | Return `true` for URLs that the cache may rewrite and proxy. |
+| `cssTransformVersion` | `string` | `''` | Bump when configuration captured by `shouldProxyPath` changes without changing the callback source. |
 | `requestTimeoutMs` | `number` | `30000` | Maximum origin-request time, including response streaming. |
 | `maxCssTransformBytes` | `number` | `5242880` | Maximum decompressed CSS size buffered for rewriting. |
+| `maxCacheSizeBytes` | `number` | none | Maximum bytes retained across unique live response bodies. Use only for a cache directory owned by one process. |
 | `warmConcurrency` | `number` | `20` | Default maximum number of simultaneous warming requests. |
 | `onEvent` | `(event: ProxyCacheEvent) => void` | none | Receives structured lifecycle events. |
 
-The three numeric options must be positive integers. An origin timeout produces HTTP 504 if response headers have not been sent. CSS that exceeds `maxCssTransformBytes` fails the response and emits a stream error event.
+Configured numeric options must be positive integers. `cachePath` must not be empty, a filesystem root (including through a symlink), or contain a dangling symlink. An origin timeout produces HTTP 504 if response headers have not been sent. CSS that exceeds `maxCssTransformBytes` fails the response and emits a stream error event.
+
+When `maxCacheSizeBytes` is configured, the cache counts content-addressed response bodies rather than index entries, so entries that share identical content consume the body size once. After a mutating request settles, the cache removes the oldest unique bodies until it is within the bound. A response larger than the bound is delivered but not retained.
 
 ### `cache.router(req, res)`
 
@@ -133,7 +142,9 @@ Responses include these diagnostic headers:
 - `x-cdn-proxy-cache-hit`: `HIT` or `MISS`.
 - `x-cdn-proxy-origin-url`: decoded origin URL.
 
-The cache does not store responses marked `no-store` or `private`. It fetches `no-cache` responses before serving them. Expired responses marked `must-revalidate` are also fetched before they are served. Other expired responses are served immediately and refreshed in the background.
+The cache does not store responses marked `no-store` or `private`, or responses with `Vary: *`. It fetches `no-cache` responses before serving them. Expired responses marked `must-revalidate` are also fetched before they are served. Other expired responses are served immediately and refreshed in the background.
+
+The proxy removes hop-by-hop response headers, fields named by `Connection`, origin-wide state headers such as `Strict-Transport-Security`, `Clear-Site-Data`, authentication challenges, and cookies that would otherwise affect the proxy application's origin. Origin responses cannot replace the proxy diagnostic headers. The origin's `Server` value is exposed as `Origin-Server`.
 
 ### `cache.replaceUrlsInHtml(html)`
 
@@ -177,6 +188,8 @@ The returned `CacheWarmStats` contains `total`, `hits`, `misses`, and `failures`
 ```typescript
 await cache.clear();
 
+const pruneStats = await cache.prune();
+
 const entries = await cache.ls();
 
 cache.isProxyPath('/__proxy_cache/cdn.jsdelivr.net/example.js');
@@ -185,7 +198,13 @@ const proxyPath = cache.encodeProxyPath('https://cdn.jsdelivr.net/example.js');
 const originUrl = cache.decodeProxyPath(proxyPath);
 ```
 
-`cache.ls()` returns the underlying `cacache.ls()` result. The encoding methods preserve an origin query string inside the proxy's `search` parameter. This leaves room for proxy-specific query parameters without changing the origin URL.
+`cache.clear()` removes cache-owned entries, bodies, temporary writes, and verification metadata while preserving unrelated files in the cache directory. `cache.prune()` checks live body integrity, removes corrupt and missing entries, reclaims orphaned content, cleans temporary writes, and returns typed reclamation statistics. Within one process, clear and prune wait for active operations on the same physical cache directory, including path aliases, and new operations wait for maintenance to finish. Failures reject the maintenance promise and release that barrier.
+
+Multiple processes may share one cache directory for ordinary requests and warming. This lets a CLI warm prime the cache used by a separate server or editor extension. Completed entries are reusable by matching requests across processes, and overlapping cold writes remain safe, although they can make duplicate origin requests because request coalescing is process-local.
+
+Cache-wide maintenance is not coordinated across processes. Stop every process that uses the directory before calling `clear()` or `prune()`. For the same reason, do not configure `maxCacheSizeBytes` on a directory shared by multiple processes: its automatic eviction is a maintenance operation. Use separate directories only when the consumers should not share warmed content or cannot be quiesced for maintenance.
+
+`cache.ls()` returns the current entries using package-owned public types. The encoding methods preserve an origin query string inside the proxy's `search` parameter. This leaves room for proxy-specific query parameters without changing the origin URL.
 
 ## Lifecycle events
 
@@ -197,7 +216,7 @@ type ProxyCacheEvent =
   | { type: 'cache-hit'; url: string; stale: boolean }
   | { type: 'cache-miss'; url: string }
   | { type: 'cache-write'; url: string; bytes: number }
-  | { type: 'cache-skip'; url: string; reason: 'no-store' | 'private' }
+  | { type: 'cache-skip'; url: string; reason: 'no-store' | 'private' | 'vary-star' }
   | { type: 'error'; url: string; phase: 'fetch' | 'stream'; error: Error };
 ```
 
@@ -228,9 +247,9 @@ The package does not install a command-line executable.
 
 ## Request flow
 
-Each request uses a cache key built from the origin URL and canonicalized `Accept` and `Accept-Encoding` values. The proxy removes Brotli from `Accept-Encoding` so browsers can share gzip or deflate entries without creating duplicates for equivalent header orderings.
+Each request uses a cache key built from the origin URL and canonicalized `Accept`, `Accept-Language`, and `Accept-Encoding` values. These are all the representation-selecting request headers forwarded to the origin; the browser's `User-Agent` is not forwarded. The proxy removes Brotli from `Accept-Encoding` so browsers can share gzip or deflate entries without creating duplicates for equivalent header orderings.
 
-On a miss, ordinary origin bodies are sent to the client and `cacache` at the same time. CSS takes a separate transformation path because `css-tree` needs the complete decompressed stylesheet; the rewritten result is cached so subsequent hits do not repeat parsing and compression. Other response bodies remain streaming.
+On a miss, ordinary origin bodies are sent to the client and `cacache` at the same time. CSS takes a separate transformation path because `css-tree` needs the complete decompressed stylesheet; the rewritten result is cached so subsequent hits do not repeat parsing and compression. The cache records a fingerprint of the transformation configuration and refetches transformed CSS when that fingerprint changes. Set `cssTransformVersion` when `shouldProxyPath` depends on closed-over configuration that may change between cache instances. Other response bodies remain streaming.
 
 ## Development
 

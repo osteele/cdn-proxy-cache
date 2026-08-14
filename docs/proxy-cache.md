@@ -30,7 +30,7 @@ The library uses npm's [cacache](https://github.com/npm/cacache) to manage the c
 
 ## Limitations
 
-The proxy cache ignores the [Cache Control directives](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cache-Control). In particular, it caches all CDN content, regardless of the presence of `no-cache`, `no-store`. `must-revalidate`, `proxy-revalidate`, and `no-transform`. In practice, the only directives observed from cached requests to the CDN servers, aside from `max-age` and `s-maxage`, are `immutable`, `public`, and `private`, which don't affect the caching policy.
+The proxy cache honors `no-store`, `private`, `no-cache`, `must-revalidate`, `max-age`, and `s-maxage`, and does not store responses with `Vary: *`. It does not currently implement `proxy-revalidate`, stale lifetime extensions, request cache directives, or `no-transform`.
 
 ## References
 

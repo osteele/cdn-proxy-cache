@@ -1,0 +1,45 @@
+-- allium: 3
+-- proxy-path-codec.allium
+--
+-- Scope: The public proxy-path codec and prefix-recognition contract.
+-- Includes: Canonical absolute HTTP(S) origins, proxy prefixes, query strings,
+-- fragments, unsupported-scheme pass-through, and proxy-path recognition.
+-- Excludes: CDN allowlist policy, HTML/CSS parsing, redirects, and cache policy.
+--
+-- Authority: Public README behavior is intended. Existing implementation is
+-- evidence, not authority, when it disagrees with this contract.
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract ProxyPathCodec {
+    encode: (origin_url: String) -> String
+    decode: (proxy_path: String) -> String
+    is_proxy_path: (candidate: String) -> Boolean
+
+    @invariant SupportedRoundTrip
+        -- Decoding an encoded canonical absolute HTTP or HTTPS origin URL
+        -- produces the exact original URL, including its query and fragment.
+
+    @invariant UnsupportedSchemePassThrough
+        -- Encoding a relative URL or an absolute URL with a scheme other than
+        -- HTTP or HTTPS returns that input unchanged.
+
+    @invariant QueryIsolation
+        -- Encoding packages the complete origin query in one proxy `search`
+        -- parameter. Other proxy-specific query parameters do not become part
+        -- of the decoded origin query.
+
+    @invariant SchemePreservation
+        -- HTTPS remains HTTPS and HTTP remains HTTP across a round trip.
+
+    @invariant PrefixBoundary
+        -- A path is recognized as proxied only when it equals the configured
+        -- prefix or begins with the prefix followed by `/`. A longer path
+        -- segment that merely shares the prefix is not a proxy path.
+
+    @invariant DeterministicEncoding
+        -- Repeated encoding of the same origin with the same configured prefix
+        -- produces the same proxy path and does not mutate global URL state.
+}

@@ -1,0 +1,172 @@
+-- allium: 3
+-- proxy-cache-lifecycle.allium
+--
+-- Scope: Observable lifecycle of one canonical cache key.
+-- Includes: Empty/fresh/stale states, storage eligibility, reload, revalidation,
+-- zero-length representations, invalidation, selector isolation, request
+-- coalescing, and cancellation ownership.
+-- Excludes: cacache layout, stream plumbing, timers, byte transforms, warming,
+-- and the exact HTTP freshness calculation.
+--
+-- Authority: README cache behavior and HTTP policy are intended. The reference
+-- model and implementation are evidence to reconcile against that intent.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+external entity Representation {
+    cache_key: String
+    body_token: String
+    body_size: Integer
+    status_code: Integer
+    storage_policy: storable | no_store | private | vary_star | error
+    freshness: fresh | stale | requires_revalidation
+    validator_result: none | unchanged | changed
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract ProxyCacheLifecycle {
+    request: (cache_key: String) -> Representation
+    reload: (cache_key: String) -> Representation
+    clear: () -> Boolean
+
+    @invariant HitMissEquivalence
+        -- A reusable hit returns the same status, selected representation, and
+        -- body as the successful miss or revalidation that populated it, apart
+        -- from documented diagnostic and freshness headers.
+
+    @invariant SelectorIsolation
+        -- Canonically equivalent selector headers share a key. Distinct origin
+        -- URLs or representation-selecting values never share a cache slot.
+
+    @invariant NonStorableAtomicity
+        -- Error, canceled, incomplete, no-store, private, and Vary-star results
+        -- leave no new reusable representation or partial committed body.
+
+    @invariant EmptyRepresentationStorage
+        -- A successful storable representation remains reusable when its body
+        -- size is zero.
+
+    @invariant Revalidation
+        -- No-cache and expired must-revalidate entries are fetched before they
+        -- are served. An unchanged validator response reuses the stored body;
+        -- a changed response replaces it.
+
+    @invariant StaleWhileRefresh
+        -- An ordinary stale entry may be served immediately while one refresh
+        -- replaces it in the background.
+
+    @invariant CoalescedOriginTransfer
+        -- Concurrent requests for the same canonical key cause at most one
+        -- origin transfer for the same cold miss or refresh generation.
+
+    @invariant CoalescedWaiterCancellationIsolation
+        -- Canceling or disconnecting a waiter that does not own the shared
+        -- origin transfer promptly ends only that wait. The active generation
+        -- and its other waiters continue unaffected.
+
+    @invariant CanceledGenerationRecovery
+        -- Canceling the waiter that owns an active generation may cancel that
+        -- generation. Other non-canceled waiters can retry in one later
+        -- generation, and no partial representation becomes reusable.
+
+    @invariant FailedGenerationRecovery
+        -- A failed generation is not treated as a reusable representation.
+        -- A non-canceled waiter can retry while successful generations remain
+        -- coalesced into one origin transfer.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity CacheSlot {
+    cache_key: String
+    state: empty | fresh | stale
+    representation: Representation when state = fresh | stale
+
+    transitions state {
+        empty -> fresh
+        fresh -> stale
+        stale -> fresh
+        fresh -> empty
+        stale -> empty
+    }
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule StoreCacheableMiss {
+    when: OriginFetchCompleted(slot, response)
+    requires: slot.state = empty
+    requires: response.cache_key = slot.cache_key
+    requires: response.storage_policy = storable
+    requires: response.status_code < 400
+    ensures: slot.state = fresh
+    ensures: slot.representation = response
+}
+
+rule LeaveUncacheableMissEmpty {
+    when: OriginFetchCompleted(slot, response)
+    requires: slot.state = empty
+    requires: response.cache_key = slot.cache_key
+    requires: response.storage_policy != storable or response.status_code >= 400
+    ensures: slot.state = empty
+}
+
+rule EntryExpires {
+    when: EntryExpires(slot)
+    requires: slot.state = fresh
+    ensures: slot.state = stale
+}
+
+rule StoreSuccessfulRefresh {
+    when: OriginRefreshCompleted(slot, response)
+    requires: slot.state = stale
+    requires: response.cache_key = slot.cache_key
+    requires: response.storage_policy = storable
+    requires: response.status_code < 400
+    ensures: slot.state = fresh
+    ensures: slot.representation = response
+}
+
+rule RetainStaleAfterRefreshFailure {
+    when: OriginRefreshFailed(slot)
+    requires: slot.state = stale
+    ensures: slot.state = stale
+}
+
+rule ClearFreshSlot {
+    when: ClearSlot(slot)
+    requires: slot.state = fresh
+    ensures: slot.state = empty
+    ensures: slot.representation = null
+}
+
+rule ClearStaleSlot {
+    when: ClearSlot(slot)
+    requires: slot.state = stale
+    ensures: slot.state = empty
+    ensures: slot.representation = null
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant UniqueSlotPerCanonicalKey {
+    for a in CacheSlots:
+        for b in CacheSlots:
+            a != b implies a.cache_key != b.cache_key
+}
+
+invariant StoredBodySizeIsNonNegative {
+    for slot in CacheSlots:
+        slot.state in {fresh, stale} implies slot.representation.body_size >= 0
+}

@@ -14,13 +14,58 @@ check:
 build:
     bun run build
 
+# Smoke-test the packed artifact with an installed Express major
+compatibility-smoke express-version:
+    bun run build
+    node scripts/test-packed-compatibility.cjs {{quote(express-version)}}
+
 # Run tests
 test:
-    bun test
+    bun run test
 
 # Run tests in watch mode
 test-watch:
     bun test --watch
+
+# Verify the Bun command-runner mutation setup without executing mutants
+mutation-dry:
+    bun run mutation:dry
+
+# Run the bounded mutation baseline configured in stryker.config.mjs
+mutation:
+    bun run mutation
+
+# Verify the stream-slice mutation setup without executing mutants
+mutation-stream-dry:
+    bun run mutation:stream:dry
+
+# Run mutation testing for stream transformation and failure handling
+mutation-stream:
+    bun run mutation:stream
+
+# Verify the security-slice mutation setup without executing mutants
+mutation-security-dry:
+    bun run mutation:security:dry
+
+# Run mutation testing for URL and response-header trust boundaries
+mutation-security:
+    bun run mutation:security
+
+# Verify the concurrency/cancellation mutation setup without executing mutants
+mutation-concurrency-dry:
+    bun run mutation:concurrency:dry
+
+# Run mutation testing for shared-work cancellation and cleanup
+mutation-concurrency:
+    bun run mutation:concurrency
+
+# Verify the cache-resource mutation setup without executing mutants
+mutation-resources-dry:
+    bun run mutation:resources:dry
+
+# Run mutation testing for maintenance barriers and storage bounds
+mutation-resources:
+    bun run mutation:resources
 
 # Type check
 typecheck:

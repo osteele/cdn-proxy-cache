@@ -30,6 +30,7 @@ type DestroyableWritable = NodeJS.WritableStream & { destroy(error?: Error): voi
 
 export function multiplexStreamWriter(streams: DestroyableWritable[]): stream.Writable {
   assert.notEqual(streams.length, 0);
+  const errorListeners = new Map<DestroyableWritable, (error: Error) => void>();
   const writer = new stream.PassThrough({
     write(chunk, encoding, callback) {
       let error: Error | null | undefined = null;
@@ -59,7 +60,14 @@ export function multiplexStreamWriter(streams: DestroyableWritable[]): stream.Wr
     },
   });
   for (const destination of streams) {
-    destination.on('error', (error) => writer.destroy(error));
+    const listener = (error: Error) => writer.destroy(error);
+    errorListeners.set(destination, listener);
+    destination.on('error', listener);
   }
+  const removeErrorListeners = () => {
+    for (const [destination, listener] of errorListeners) destination.off('error', listener);
+  };
+  writer.once('finish', removeErrorListeners);
+  writer.once('close', removeErrorListeners);
   return writer;
 }
